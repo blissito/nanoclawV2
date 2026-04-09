@@ -75,4 +75,4 @@ try {
   }
 }
 
-console.log('Done! Run: npm run build && node dist/index-v2.js');
+console.log('Done! Run: npm run build && node dist/index.js');

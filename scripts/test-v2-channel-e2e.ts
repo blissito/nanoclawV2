@@ -67,7 +67,7 @@ console.log('✓ Central DB initialized');
 // --- Step 2: Set up mock channel adapter + delivery ---
 console.log('\n=== Step 2: Set up mock channel adapter & delivery ===');
 
-import { routeInbound } from '../src/router-v2.js';
+import { routeInbound } from '../src/router.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, stopDeliveryPolls } from '../src/delivery.js';
 import { getChannelAdapter, registerChannelAdapter, initChannelAdapters } from '../src/channels/channel-registry.js';
 import { findSession } from '../src/db/sessions.js';
