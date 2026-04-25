@@ -153,6 +153,10 @@ async function main(): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
     },
+    async reactToMessage(channelType: string, platformId: string, messageId: string, emoji: string): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.reactToMessage?.(platformId, messageId, emoji);
+    },
   };
   setDeliveryAdapter(deliveryAdapter);
 

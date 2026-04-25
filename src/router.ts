@@ -32,6 +32,7 @@ import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
+import { markPending } from './status-tracker.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
@@ -453,6 +454,22 @@ async function deliverToAgent(
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires.
     startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+
+    // Host-side acknowledgement: react with 👀 immediately so the user sees
+    // we got the message before the container even spawns. Mirrors v1's
+    // status-tracker (src/status-tracker.ts:96 `\u{1F440}` on RECEIVED).
+    // Fire-and-forget — never block message processing on a reaction.
+    // Also mark pending so delivery.ts can flip to ✅ when the agent replies.
+    const adapter = getChannelAdapter(event.channelType);
+    if (adapter?.reactToMessage) {
+      void adapter
+        .reactToMessage(event.platformId, event.message.id, '\u{1F440}')
+        .catch((err) =>
+          log.debug('reactToMessage failed', { channelType: event.channelType, err }),
+        );
+      markPending(event.platformId, event.message.id);
+    }
+
     const freshSession = getSession(session.id);
     if (freshSession) {
       await wakeContainer(freshSession);

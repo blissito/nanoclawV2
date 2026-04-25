@@ -24,6 +24,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { consumePending } from './status-tracker.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -59,6 +60,7 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
+  reactToMessage?(channelType: string, platformId: string, messageId: string, emoji: string): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -367,6 +369,29 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // Flip pending 👀 → ✅ on the user's message(s) once the agent's reply
+  // (a chat-kind outbound that is NOT a reaction/edit operation) lands.
+  // Fire-and-forget; never block delivery on the reaction send.
+  if (msg.kind === 'chat' && deliveryAdapter.reactToMessage && msg.platform_id) {
+    let isOperation = false;
+    try {
+      const parsed = JSON.parse(msg.content);
+      isOperation = !!parsed?.operation;
+    } catch {
+      /* not JSON, treat as plain text outbound */
+    }
+    if (!isOperation) {
+      const pending = consumePending(msg.platform_id);
+      for (const inboundId of pending) {
+        void deliveryAdapter
+          .reactToMessage(msg.channel_type, msg.platform_id, inboundId, '\u{2705}')
+          .catch((err) =>
+            log.debug('done-reaction failed', { channelType: msg.channel_type, err }),
+          );
+      }
+    }
+  }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 

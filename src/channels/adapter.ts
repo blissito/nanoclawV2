@@ -137,6 +137,14 @@ export interface ChannelAdapter {
   syncConversations?(): Promise<ConversationInfo[]>;
 
   /**
+   * React to a specific platform message with a raw unicode emoji. Used by
+   * the host's status tracker to surface working/done state on the user's
+   * message — independent of whether the agent calls add_reaction. v1 has
+   * the same primitive in `status-tracker.ts` (sendReaction).
+   */
+  reactToMessage?(platformId: string, messageId: string, emoji: string): Promise<void>;
+
+  /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
    * Called by the router when a mention-sticky wiring first engages in a
