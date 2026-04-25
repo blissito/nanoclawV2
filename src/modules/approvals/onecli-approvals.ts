@@ -145,7 +145,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   const approvalId = shortApprovalId();
   const question = buildQuestion(request, originGroup?.name ?? request.agent.name);
 
-  const onecliTitle = 'Credentials Request';
+  const onecliTitle = 'Solicitud: uso de credenciales';
   const onecliOptions = [
     { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
     { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },

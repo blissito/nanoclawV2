@@ -348,7 +348,12 @@ function evaluateEngage(
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
       try {
-        return new RegExp(pat).test(text);
+        // Case-insensitive by default — operators rarely care about case
+        // when triggering by name (e.g. "ghosty" vs "Ghosty"). If a user
+        // ever needs case-sensitive matching they can encode it in the
+        // pattern with an inline lookahead, but the common case is name
+        // triggers that should work in any casing the human types.
+        return new RegExp(pat, 'i').test(text);
       } catch {
         // Bad regex: fail open so admin sees the agent responding + can fix.
         return true;

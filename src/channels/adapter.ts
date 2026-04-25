@@ -163,6 +163,48 @@ export interface ChannelAdapter {
    * Returning the same platform_id on repeated calls is expected.
    */
   openDM?(userHandle: string): Promise<string>;
+
+  /**
+   * Create a brand-new chat/group on the platform under the bot's account.
+   * Returns the new chat's `platform_id` and an optional invite link
+   * (if the platform exposes one).
+   *
+   * WhatsApp today: implemented via Baileys `sock.groupCreate(subject, [])`
+   * + `sock.groupInviteCode(jid)`. Bot is the only initial member; others
+   * join via the invite link.
+   *
+   * Other adapters (Telegram, Signal, Matrix) MAY implement this if their
+   * platform supports bot-initiated group creation. Adapters that don't
+   * support it should leave the method undefined; callers fall back to
+   * telling the user to create the chat manually.
+   */
+  createGroup?(subject: string): Promise<{ platformId: string; inviteLink: string | null }>;
+
+  /**
+   * Fetch (or regenerate) the invite link for an existing group. Useful
+   * when the user wants to re-share access after the link from
+   * `createGroup` was lost, or when wiring up a group that was created
+   * via the platform UI directly.
+   *
+   * Returns `null` if the platform does not expose an invite link or the
+   * call failed (e.g. the bot is not a group admin).
+   */
+  getInviteLink?(platformId: string): Promise<string | null>;
+
+  /**
+   * Bot leaves the group on the platform. Does not touch NanoClaw DB
+   * state — the host handler is responsible for cleaning up
+   * `messaging_groups` / `messaging_group_agents` rows after this
+   * resolves successfully.
+   */
+  leaveGroup?(platformId: string): Promise<void>;
+
+  /**
+   * Rename a group on the platform (changes the subject visible to all
+   * members). Bot must be a group admin. Does not update the NanoClaw
+   * `messaging_groups.name` row — the host handler does that on success.
+   */
+  renameGroup?(platformId: string, newName: string): Promise<void>;
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */

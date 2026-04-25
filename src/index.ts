@@ -10,6 +10,7 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { upsertDiscoveredChannel } from './db/discovered-channels.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -107,6 +108,11 @@ async function main(): Promise<void> {
           name,
           isGroup,
         });
+        try {
+          upsertDiscoveredChannel(adapter.channelType, platformId, name ?? null, isGroup === true);
+        } catch (err) {
+          log.warn('Failed to upsert discovered channel', { channelType: adapter.channelType, platformId, err });
+        }
       },
       onAction(questionId, selectedOption, userId) {
         dispatchResponse({
