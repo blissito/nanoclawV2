@@ -689,6 +689,70 @@ export async function applyLeaveGroup(
   );
 }
 
+/**
+ * Update `unknown_sender_policy` of an existing messaging_group. Filed as
+ * a separate action (not a flag on register_channel) so the intent is
+ * explicit — register_channel deliberately does not touch policy on
+ * existing rows to avoid surprising side-effects when an agent re-wires.
+ */
+export async function applyUpdateChannelPolicy(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
+  const platformId = content.platform_id as string | undefined;
+  const policy = content.unknown_sender_policy as string | undefined;
+  if (!platformId || !policy) {
+    notifyAgent(session, 'update_channel_policy rejected: platform_id and unknown_sender_policy are required.');
+    return;
+  }
+  if (!['strict', 'request_approval', 'public'].includes(policy)) {
+    notifyAgent(session, `update_channel_policy rejected: unknown_sender_policy must be one of "strict" | "request_approval" | "public" (got "${policy}").`);
+    return;
+  }
+
+  const userId = getLastInboundUserId(inDb);
+  if (!userId) {
+    notifyAgent(session, 'update_channel_policy rejected: could not resolve the calling user from the current session.');
+    return;
+  }
+
+  const channelType = (content.channel_type as string | undefined) || 'whatsapp';
+  const mg = getMessagingGroupByPlatform(channelType, platformId);
+  if (!mg) {
+    notifyAgent(session, `update_channel_policy rejected: no messaging_group found for ${channelType}:${platformId}. Use register_channel first.`);
+    return;
+  }
+
+  const targetAgentGroupId =
+    getMessagingGroupAgents(mg.id)[0]?.agent_group_id ?? session.agent_group_id;
+  const access = canAccessAgentGroup(userId, targetAgentGroupId);
+  const privileged = access.allowed && ['owner', 'global_admin', 'admin_of_group'].includes(access.reason);
+  if (!privileged) {
+    notifyAgent(
+      session,
+      `update_channel_policy rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+    );
+    return;
+  }
+
+  try {
+    updateMessagingGroup(mg.id, { unknown_sender_policy: policy as 'strict' | 'request_approval' | 'public' });
+    log.info('update_channel_policy applied', { mgId: mg.id, platformId, policy });
+  } catch (err) {
+    notifyAgent(
+      session,
+      `update_channel_policy failed: ${err instanceof Error ? err.message : String(err)}.`,
+    );
+    return;
+  }
+
+  notifyAgent(
+    session,
+    `Channel policy updated for ${platformId}: unknown_sender_policy="${policy}".\n\nReport to the user in Spanish:\n  • "strict" → mensajes de senders desconocidos se ignoran silenciosamente.\n  • "request_approval" → te llega un DM pidiendo aprobación antes de procesar.\n  • "public" → cualquier sender del grupo es atendido sin gate.`,
+  );
+}
+
 export async function applyRenameGroup(
   content: Record<string, unknown>,
   session: Session,

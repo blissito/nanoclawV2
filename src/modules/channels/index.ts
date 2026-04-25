@@ -12,6 +12,7 @@ import {
   applyListDiscoveredGroups,
   applyRegisterChannel,
   applyRenameGroup,
+  applyUpdateChannelPolicy,
 } from './apply.js';
 
 registerDeliveryAction('register_channel', applyRegisterChannel);
@@ -21,3 +22,4 @@ registerDeliveryAction('create_group', applyCreateGroup);
 registerDeliveryAction('get_invite_link', applyGetInviteLink);
 registerDeliveryAction('leave_group', applyLeaveGroup);
 registerDeliveryAction('rename_group', applyRenameGroup);
+registerDeliveryAction('update_channel_policy', applyUpdateChannelPolicy);

@@ -406,6 +406,53 @@ export const renameGroup: McpToolDefinition = {
   },
 };
 
+export const updateChannelPolicy: McpToolDefinition = {
+  tool: {
+    name: 'update_channel_policy',
+    description:
+      "Change `unknown_sender_policy` of an existing wired channel. Use when user asks to make a group public/strict, or to start/stop requesting approval for unknown senders. Caller must be owner/admin of the agent group. Fire-and-forget; result in next message.\n\n  • strict           — drop unknown senders silently\n  • request_approval — DM owner asking to allow (default for new groups)\n  • public           — accept any sender (no gate)",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform_id: {
+          type: 'string',
+          description: 'Channel platform_id of the wired channel (e.g., WhatsApp group "<id>@g.us").',
+        },
+        unknown_sender_policy: {
+          type: 'string',
+          enum: ['strict', 'request_approval', 'public'],
+          description: 'New policy.',
+        },
+        channel_type: {
+          type: 'string',
+          description: 'Channel adapter name. Defaults to "whatsapp" if omitted.',
+        },
+      },
+      required: ['platform_id', 'unknown_sender_policy'],
+    },
+  },
+  async handler(args) {
+    const platform_id = args.platform_id as string;
+    const unknown_sender_policy = args.unknown_sender_policy as string;
+    const channel_type = (args.channel_type as string) || 'whatsapp';
+    if (!platform_id) return err('platform_id is required');
+    if (!unknown_sender_policy) return err('unknown_sender_policy is required');
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'update_channel_policy',
+        platform_id,
+        unknown_sender_policy,
+        channel_type,
+      }),
+    });
+    log(`update_channel_policy: ${requestId} → ${platform_id} = ${unknown_sender_policy}`);
+    return ok('Policy update submitted. Result in my next message.');
+  },
+};
+
 registerTools([
   registerChannel,
   listChannels,
@@ -414,4 +461,5 @@ registerTools([
   getInviteLink,
   leaveGroup,
   renameGroup,
+  updateChannelPolicy,
 ]);
