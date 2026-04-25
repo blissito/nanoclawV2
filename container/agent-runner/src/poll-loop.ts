@@ -2,7 +2,7 @@ import fs from 'fs';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
@@ -221,6 +221,18 @@ function checkRestartSentinel(reason: string): void {
   if (!fs.existsSync(RESTART_SENTINEL_PATH)) return;
   console.error(`[poll-loop] Restart sentinel found (${reason}) — exiting so next message spawns a fresh container`);
   try { fs.unlinkSync(RESTART_SENTINEL_PATH); } catch {}
+  // Clean up any 'processing' processing_ack rows in outbound.db before exit.
+  // Otherwise the host's next sweep tick races: it wakes a fresh container
+  // (because dueCount > 0), then in the SAME tick its claim-stuck check sees
+  // the lingering 'processing' row from this container, decides it's stuck,
+  // and kills the just-spawned successor before it can finish startup.
+  // The fresh container's own clearStaleProcessingAcks() at line 51 would
+  // handle this too, but only if it gets to run before the sweep tick.
+  try {
+    getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
+  } catch (e) {
+    console.error(`[poll-loop] failed to clear stale processing_ack pre-exit: ${e instanceof Error ? e.message : String(e)}`);
+  }
   process.exit(0);
 }
 
