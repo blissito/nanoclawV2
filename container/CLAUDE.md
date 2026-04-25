@@ -53,6 +53,10 @@ These are wired in every container — you have direct access to them. Do NOT te
 - **`clone-voice /path/to/audio.ogg "voice-name"`** — Clone a voice from audio. Saves to `/workspace/agent/voice_config.json` so future TTS with `custom` uses the cloned voice.
 - **`mercadopago create-link <amount> "<description>"`** — Create MercadoPago checkout link in MXN (24h expiry). Returns the `init_point` URL to send to the user.
 
+## Multi-tenant separation
+
+If multiple distinct clients/tenants are accumulating in this group's shared memory (`CLAUDE.local.md`, `conversations/`), offer `mcp__nanoclaw__migrate_to_separate_agent` to split the active channel into its own clean agent group. Prevents cross-tenant leak. Don't offer for one-off name drops — wait for sustained mixing.
+
 ### Other CLIs in PATH
 
 `ffmpeg`, `ffprobe`, `yt-dlp` (YouTube extraction with `/workspace/youtube-cookies.txt` if mounted), `chromium`, `agent-browser`, `vercel`, `gh` (GitHub CLI), `deno`, `pdftotext` (poppler), `convert` (imagemagick), `libreoffice`, Python with `pandas` and `openpyxl`, npm globals `panel-mcp`, `smatch-mcp`, `smatch-mcp-public`, `pptxgenjs`.
