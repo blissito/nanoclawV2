@@ -453,6 +453,59 @@ export const updateChannelPolicy: McpToolDefinition = {
   },
 };
 
+export const migrateToSeparateAgent: McpToolDefinition = {
+  tool: {
+    name: 'migrate_to_separate_agent',
+    description:
+      "Split a wired channel away from THIS agent group into a NEW, isolated agent group with its own folder, CLAUDE.local.md, and container. Use to separate clients/tenants that currently share an agent so they cannot leak context via shared memory or conversations. The new agent group starts CLEAN — no copy of memory, settings, or history from this one (that's the point). Caller must be global owner/admin. Fire-and-forget; result in next message.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform_id: {
+          type: 'string',
+          description: 'Channel platform_id of the wired channel to split off (e.g. "<id>@g.us" for a WhatsApp group, "<phone>@s.whatsapp.net" for a DM).',
+        },
+        new_folder: {
+          type: 'string',
+          description: 'Folder name for the new agent group under groups/. Alphanumeric, dashes, underscores. Must not already exist.',
+        },
+        new_agent_name: {
+          type: 'string',
+          description: 'Display name for the new agent group.',
+        },
+        channel_type: {
+          type: 'string',
+          description: 'Channel adapter name. Defaults to "whatsapp" if omitted.',
+        },
+      },
+      required: ['platform_id', 'new_folder', 'new_agent_name'],
+    },
+  },
+  async handler(args) {
+    const platform_id = args.platform_id as string;
+    const new_folder = args.new_folder as string;
+    const new_agent_name = args.new_agent_name as string;
+    const channel_type = (args.channel_type as string) || 'whatsapp';
+    if (!platform_id) return err('platform_id is required');
+    if (!new_folder) return err('new_folder is required');
+    if (!new_agent_name) return err('new_agent_name is required');
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'migrate_to_separate_agent',
+        platform_id,
+        new_folder,
+        new_agent_name,
+        channel_type,
+      }),
+    });
+    log(`migrate_to_separate_agent: ${requestId} → ${platform_id} → ${new_folder}`);
+    return ok('Migration submitted. Result in my next message.');
+  },
+};
+
 registerTools([
   registerChannel,
   listChannels,
@@ -462,4 +515,5 @@ registerTools([
   leaveGroup,
   renameGroup,
   updateChannelPolicy,
+  migrateToSeparateAgent,
 ]);

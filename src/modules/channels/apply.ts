@@ -822,3 +822,167 @@ export async function applyRenameGroup(
     `Renamed WhatsApp group ${platformId} to "${newName}".\nReport to the user in Spanish: confirm the new name and mention all current members will see the change.`,
   );
 }
+
+/**
+ * Split a single (messaging_group ↔ this agent_group) wiring off into a
+ * brand-new agent group. The new group has its own folder, CLAUDE.local.md,
+ * and container — nothing is copied from the source. Used to isolate
+ * tenants/clients that currently share an agent so they can no longer
+ * leak context via shared memory.
+ *
+ * Wiring config (engage_mode, session_mode, sender_scope, etc.) is preserved
+ * — only the agent_group target changes. The agent_group_members access list
+ * does NOT carry over (that's the security point); the operator has to grant
+ * access on the new group separately.
+ *
+ * Privilege: global owner/admin only. Mirrors register_channel's stance —
+ * scoped admins should not be able to spin up new agent groups.
+ */
+export async function applyMigrateToSeparateAgent(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
+  const platformId = content.platform_id as string | undefined;
+  const newFolder = (content.new_folder as string | undefined)?.trim();
+  const newAgentName = (content.new_agent_name as string | undefined)?.trim();
+  const channelType = (content.channel_type as string | undefined) || 'whatsapp';
+
+  if (!platformId || !newFolder || !newAgentName) {
+    notifyAgent(
+      session,
+      'migrate_to_separate_agent rejected: platform_id, new_folder, and new_agent_name are required.',
+    );
+    return;
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(newFolder)) {
+    notifyAgent(
+      session,
+      'migrate_to_separate_agent rejected: new_folder must be alphanumeric, dashes, or underscores only.',
+    );
+    return;
+  }
+
+  const userId = getLastInboundUserId(inDb);
+  if (!userId) {
+    notifyAgent(
+      session,
+      'migrate_to_separate_agent rejected: could not resolve the calling user from the current session.',
+    );
+    return;
+  }
+
+  // Privilege: global owner/admin only — same gate as register_channel for
+  // creating a new agent group. A scoped admin of just one group can't spin
+  // up new ones; that's a deliberate access boundary.
+  const access = canAccessAgentGroup(userId, session.agent_group_id);
+  const allowed = access.allowed && ['owner', 'global_admin'].includes(access.reason);
+  if (!allowed) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent rejected: requires global owner or admin. Your role for this agent group: ${access.allowed ? access.reason : access.reason ?? 'none'}.`,
+    );
+    return;
+  }
+
+  const mg = getMessagingGroupByPlatform(channelType, platformId);
+  if (!mg) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent rejected: no messaging_group found for ${channelType}:${platformId}. Use list_channels to see what's wired.`,
+    );
+    return;
+  }
+
+  const wirings = getMessagingGroupAgents(mg.id);
+  const currentWiring = wirings.find((w) => w.agent_group_id === session.agent_group_id);
+  if (!currentWiring) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent rejected: ${platformId} is not wired to this agent group. Migration only works on a channel currently linked to the calling agent group.`,
+    );
+    return;
+  }
+
+  if (getAgentGroupByFolder(newFolder)) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent rejected: folder "${newFolder}" already exists. Pick a different folder name.`,
+    );
+    return;
+  }
+
+  // Create new agent group + scaffold filesystem
+  const newId = generateId('ag');
+  const newAgentGroup = {
+    id: newId,
+    name: newAgentName,
+    folder: newFolder,
+    agent_provider: 'claude',
+    created_at: new Date().toISOString(),
+  };
+  try {
+    createAgentGroup(newAgentGroup);
+    initGroupFilesystem(newAgentGroup);
+    log.info('migrate_to_separate_agent: new agent group created', {
+      agentGroupId: newId,
+      folder: newFolder,
+    });
+  } catch (err) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent failed creating new agent group: ${err instanceof Error ? err.message : String(err)}.`,
+    );
+    return;
+  }
+
+  // Rewire: drop the old (mg, this-agent-group) row, create a fresh one
+  // pointing to the new agent group with the same engage/session config.
+  // updateMessagingGroupAgent doesn't allow agent_group_id changes by design,
+  // so we delete + recreate. New mga id so the old wiring's history is
+  // distinct from the new one in any audit logs.
+  try {
+    const newMgaId = generateId('mga');
+    deleteMessagingGroupAgent(currentWiring.id);
+    createMessagingGroupAgent({
+      id: newMgaId,
+      messaging_group_id: mg.id,
+      agent_group_id: newId,
+      engage_mode: currentWiring.engage_mode,
+      engage_pattern: currentWiring.engage_pattern,
+      sender_scope: currentWiring.sender_scope,
+      ignored_message_policy: currentWiring.ignored_message_policy,
+      session_mode: currentWiring.session_mode,
+      priority: currentWiring.priority,
+      created_at: new Date().toISOString(),
+    });
+    log.info('migrate_to_separate_agent: rewired', {
+      mgId: mg.id,
+      from: session.agent_group_id,
+      to: newId,
+      platformId,
+    });
+  } catch (err) {
+    notifyAgent(
+      session,
+      `migrate_to_separate_agent: new agent group "${newFolder}" was created but rewiring failed — channel still points to the old group. Error: ${err instanceof Error ? err.message : String(err)}.`,
+    );
+    return;
+  }
+
+  notifyAgent(
+    session,
+    [
+      `Channel ${platformId} migrated to a NEW isolated agent group:`,
+      `  • id: ${newId}`,
+      `  • folder: groups/${newFolder}/`,
+      `  • name: ${newAgentName}`,
+      ``,
+      `Memory, conversations, and settings from this group were NOT copied — that's the point.`,
+      `Subsequent messages from ${platformId} spawn a fresh container in the new group; this group no longer receives traffic from that channel.`,
+      `Access list (agent_group_members) does NOT carry over — owner remains global, but admins/members of this group must be granted on the new one separately.`,
+      ``,
+      `Report to the user in Spanish: confirm the migration, recordar que el agente nuevo arranca sin memoria del actual (eso es el punto, evita leak), y que el siguiente mensaje desde ${platformId} ya cae al nuevo agente.`,
+    ].join('\n'),
+  );
+}

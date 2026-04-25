@@ -10,6 +10,7 @@ import {
   applyLeaveGroup,
   applyListChannels,
   applyListDiscoveredGroups,
+  applyMigrateToSeparateAgent,
   applyRegisterChannel,
   applyRenameGroup,
   applyUpdateChannelPolicy,
@@ -23,3 +24,4 @@ registerDeliveryAction('get_invite_link', applyGetInviteLink);
 registerDeliveryAction('leave_group', applyLeaveGroup);
 registerDeliveryAction('rename_group', applyRenameGroup);
 registerDeliveryAction('update_channel_policy', applyUpdateChannelPolicy);
+registerDeliveryAction('migrate_to_separate_agent', applyMigrateToSeparateAgent);
