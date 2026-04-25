@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
@@ -8,6 +9,15 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+/**
+ * Sentinel a tool can drop to ask the container to exit cleanly at end-of-turn.
+ * The host's `--rm` plus session DB persistence means the next inbound message
+ * spawns a fresh container that resumes the same session — useful when a tool
+ * (e.g. google_workspace_status, after sending an OAuth magic link) knows the
+ * MCP server config will be stale until a respawn refreshes it.
+ */
+const RESTART_SENTINEL_PATH = '/workspace/.restart-requested';
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -197,6 +207,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 }
 
 /**
+ * If a tool dropped the restart sentinel (e.g. google_workspace_status after
+ * sending an OAuth magic link), exit cleanly so the user's next message
+ * wakes a fresh container with up-to-date MCP wiring.
+ *
+ * NOTE: processQuery doesn't return between turns — the SDK keeps the query
+ * stream open for follow-ups (cheaper than reopening, preserves prompt cache).
+ * So this check has to fire FROM INSIDE processQuery: once after each result
+ * event, and again in the follow-up poll before pushing new input. Either
+ * triggers `process.exit(0)` and Docker `--rm` cleans up.
+ */
+function checkRestartSentinel(reason: string): void {
+  if (!fs.existsSync(RESTART_SENTINEL_PATH)) return;
+  console.error(`[poll-loop] Restart sentinel found (${reason}) — exiting so next message spawns a fresh container`);
+  try { fs.unlinkSync(RESTART_SENTINEL_PATH); } catch {}
+  process.exit(0);
+}
+
+/**
  * Format messages, handling passthrough commands differently.
  * When the provider handles slash commands natively (Claude Code),
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
@@ -251,6 +279,11 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
+    // Restart sentinel takes priority over delivering follow-ups: if a tool
+    // armed a restart (OAuth magic link, etc.), don't push new messages into
+    // a soon-to-be-stale query — exit and let the host respawn.
+    checkRestartSentinel('follow-up poll');
+
     // Skip system messages (MCP tool responses) and /clear (needs fresh query).
     // Thread routing is the router's concern — if a message landed in this
     // session, the agent should see it. Per-thread sessions already isolate
@@ -300,6 +333,10 @@ async function processQuery(
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
+        // Tool-armed restart: now that the user-facing message has been
+        // dispatched, it's safe to exit so the next inbound message wakes a
+        // fresh container with refreshed MCP wiring.
+        checkRestartSentinel('end of turn');
       }
     }
   } finally {

@@ -57,6 +57,9 @@ const TOOL_ALLOWLIST = [
   'mcp__nanoclaw__*',
   'mcp__easybits__*',
   'mcp__brightdata__*',
+  'mcp__gmail__*',
+  'mcp__drive__*',
+  'mcp__calendar__*',
 ];
 
 interface SDKUserMessage {

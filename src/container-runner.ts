@@ -432,7 +432,11 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const args: string[] = [
+    'run', '--rm', '--name', containerName,
+    '--label', CONTAINER_INSTALL_LABEL,
+    '--label', `nanoclaw-agent-group-id=${agentGroup.id}`,
+  ];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -446,6 +450,8 @@ async function buildContainerArgs(
   const passthroughEnv = readEnvFile([
     'BRIGHTDATA_API_TOKEN',
     'EASYBITS_API_KEY',
+    'NANOCLAW_ADMIN_TOKEN',
+    'GHOSTY_STUDIO_API_BASE',
   ]);
   for (const [key, value] of Object.entries(passthroughEnv)) {
     if (value) args.push('-e', `${key}=${value}`);
@@ -473,6 +479,17 @@ async function buildContainerArgs(
   } catch (err) {
     log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
   }
+
+  // Google Workspace MCP servers must bypass the OneCLI proxy. OneCLI MITMs
+  // HTTPS to inject credentials for hosts in its vault; for *.googleapis.com
+  // it has no entry, so the MITM produces a self-signed cert the container
+  // doesn't trust → TLS handshake fails. The Bearer token we set ourselves
+  // (from /api/oauth/google/access-token) is what authenticates these
+  // requests, so we want them to skip the proxy entirely. Same pattern as
+  // BrightData's NO_PROXY in mcp-tools/index.ts.
+  const googleMcpHosts = 'gmailmcp.googleapis.com,drivemcp.googleapis.com,calendarmcp.googleapis.com';
+  args.push('-e', `NO_PROXY=${googleMcpHosts}`);
+  args.push('-e', `no_proxy=${googleMcpHosts}`);
 
   // Host gateway
   args.push(...hostGatewayArgs());

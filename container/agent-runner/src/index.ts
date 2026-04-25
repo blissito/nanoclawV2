@@ -31,6 +31,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -38,6 +39,57 @@ function log(msg: string): void {
 }
 
 const CWD = '/workspace/agent';
+
+const GOOGLE_MCP_ENDPOINTS: Record<string, string> = {
+  gmail: 'https://gmailmcp.googleapis.com/mcp/v1',
+  drive: 'https://drivemcp.googleapis.com/mcp/v1',
+  calendar: 'https://calendarmcp.googleapis.com/mcp/v1',
+};
+
+async function wireGoogleWorkspaceMcps(
+  mcpServers: Record<string, McpServerConfig>,
+  agentGroupId: string,
+): Promise<void> {
+  if (!agentGroupId) {
+    log('Google Workspace: skipped (agentGroupId missing in container.json)');
+    return;
+  }
+  const adminToken = process.env.NANOCLAW_ADMIN_TOKEN?.trim();
+  if (!adminToken) {
+    log('Google Workspace: skipped (NANOCLAW_ADMIN_TOKEN missing in container env)');
+    return;
+  }
+  const apiBase = (process.env.GHOSTY_STUDIO_API_BASE?.trim() || 'https://ghosty.studio').replace(/\/+$/, '');
+
+  let result: { access_token: string; connected_email: string } | null = null;
+  try {
+    const r = await fetch(
+      `${apiBase}/api/oauth/google/access-token?agent_group_id=${encodeURIComponent(agentGroupId)}`,
+      { headers: { authorization: `Bearer ${adminToken}` } },
+    );
+    if (r.status === 200) {
+      result = (await r.json()) as { access_token: string; connected_email: string };
+    } else if (r.status === 404) {
+      log('Google Workspace: not connected for this agent group (use google_workspace_status to onboard)');
+      return;
+    } else {
+      const body = await r.text().catch(() => '');
+      log(`Google Workspace: skip — access-token endpoint ${r.status}: ${body.slice(0, 200)}`);
+      return;
+    }
+  } catch (err) {
+    log(`Google Workspace: skip — network error fetching access_token: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  if (!result) return;
+
+  const headers = { Authorization: `Bearer ${result.access_token}` };
+  for (const [name, url] of Object.entries(GOOGLE_MCP_ENDPOINTS)) {
+    mcpServers[name] = { type: 'http', url, headers };
+  }
+  log(`Google Workspace: wired ${Object.keys(GOOGLE_MCP_ENDPOINTS).join(', ')} as ${result.connected_email}`);
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -73,7 +125,7 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
@@ -109,6 +161,13 @@ async function main(): Promise<void> {
     mcpServers[name] = serverConfig;
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
+
+  // Google Workspace: native MCP servers (gmail/drive/calendar.mcp.googleapis.com)
+  // are gated by Google's Developer Preview Program. While we wait for that
+  // approval, the agent uses REST-API-backed MCP tools (calendar_list_events,
+  // calendar_create_event, gmail_send, etc.) registered by mcp-tools/google.ts.
+  // When preview is granted, uncomment the line below to swap to native MCPs:
+  //   await wireGoogleWorkspaceMcps(mcpServers, config.agentGroupId);
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
