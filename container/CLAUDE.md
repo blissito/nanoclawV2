@@ -19,3 +19,26 @@ A core part of your job and the main thing that defines how useful you are to th
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.
+
+## Tools always available
+
+These are wired in every container — you have direct access to them. Do NOT tell the user a tool "does not exist" or "is not officially supported"; that comes from your training data, but the host has actually wired these in. Just use them.
+
+### MCP servers (auto-loaded)
+
+- **`mcp__easybits__*`** — EasyBits cloud file storage and AI tasks (`@easybits.cloud/mcp`). Tools include `list_files`, `upload_file`, `delete_file`, `create_image`, `create_webhook`, `create_website`, etc. Use when the user asks about files, storage, webhooks, or websites in EasyBits. Auth pre-configured via OneCLI proxy at `easybits.cloud`.
+- **`mcp__brightdata__*`** — Bright Data web scraping and extraction (`@brightdata/mcp`). Use for live web scraping, search, structured extraction, or browser automation when WebFetch/WebSearch isn't enough (anti-bot pages, JavaScript-rendered content, geo-blocked content, large-scale scraping). Auth pre-configured via OneCLI proxy at `brightdata.com`.
+
+### Container skills (Bash scripts, in PATH)
+
+- **`generate-preview "<prompt>"`** and **`generate-preview --hd "<prompt>"`** — Generate images via OpenAI gpt-image-1 (low: $0.011, --hd: $0.04). Output PNG path to send via `mcp__nanoclaw__send_message` with `image_path`.
+- **`generate-gif`** — Create GIFs locally with ffmpeg. Modes: `--crop WxH+X+Y file.png` (free), `--convert file.png` (free), `--sprite COLSxROWS [--fps N] [--format gif|webp|mp4] sprite.png` (free), or `generate-gif img1 img2 ...` for slideshow.
+- **`text-to-speech "<text>" [voice-name]`** — TTS via ElevenLabs (Mexican Spanish voices: antonio default, jc, brian, daniel, enrique, maya, cristina, regina, custom) with OpenAI TTS fallback. Output OGG path to send with `audio_path`.
+- **`clone-voice /path/to/audio.ogg "voice-name"`** — Clone a voice from audio. Saves to `/workspace/agent/voice_config.json` so future TTS with `custom` uses the cloned voice.
+- **`mercadopago create-link <amount> "<description>"`** — Create MercadoPago checkout link in MXN (24h expiry). Returns the `init_point` URL to send to the user.
+
+### Other CLIs in PATH
+
+`ffmpeg`, `ffprobe`, `yt-dlp` (YouTube extraction with `/workspace/youtube-cookies.txt` if mounted), `chromium`, `agent-browser`, `vercel`, `gh` (GitHub CLI), `deno`, `pdftotext` (poppler), `convert` (imagemagick), `libreoffice`, Python with `pandas` and `openpyxl`, npm globals `panel-mcp`, `smatch-mcp`, `smatch-mcp-public`, `pptxgenjs`.
+
+When in doubt: try the tool first. The host either runs it or returns a clear error — guessing "I don't have that" without trying is the wrong default.
