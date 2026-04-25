@@ -13,6 +13,11 @@
  */
 import fs from 'fs';
 import path from 'path';
+import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 // Named import (not default) — pino's .d.ts under NodeNext resolution
 // exports `{ pino as default, pino }`, but the namespace/function merge at
 // `declare namespace pino` + `declare function pino` makes the default
@@ -139,7 +144,15 @@ function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?
     return { video: data, caption, mimetype: `video/${ext.slice(1)}` };
   }
   if (audioExts.includes(ext)) {
-    return { audio: data, mimetype: `audio/${ext.slice(1) === 'mp3' ? 'mpeg' : ext.slice(1)}` };
+    // ogg/opus → voice note (push-to-talk). The full mimetype with the
+    // codec parameter is load-bearing: WhatsApp shows "Waiting for this
+    // message" indefinitely if it receives plain `audio/ogg` without the
+    // `codecs=opus` hint. This matches v1's sendAudio exactly.
+    const isVoiceNote = ext === '.ogg' || ext === '.opus';
+    const mimetype = isVoiceNote
+      ? 'audio/ogg; codecs=opus'
+      : `audio/${ext.slice(1) === 'mp3' ? 'mpeg' : ext.slice(1)}`;
+    return { audio: data, mimetype, ptt: isVoiceNote };
   }
   // Default: send as document
   return { document: data, fileName: filename, caption, mimetype: 'application/octet-stream' };
@@ -172,6 +185,12 @@ registerChannelAdapter('whatsapp', {
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+    // Cache of inbound WAMessageKey indexed by msg.key.id, kept so the host
+    // can react to a user's message in a group — Baileys needs `participant`
+    // in the reaction key, which only the original key carries.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const inboundKeyCache = new Map<string, any>();
+    const INBOUND_KEY_CACHE_MAX = 500;
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -236,19 +255,19 @@ registerChannelAdapter('whatsapp', {
       const cached = groupMetadataCache.get(jid);
       if (cached && cached.expiresAt > Date.now()) return cached.metadata;
 
+      // IMPORTANT: return participant IDs untouched (incl. `@lid`).
+      // Baileys uses this list for group send fan-out — it looks up Signal
+      // sessions and device lists keyed by JID. Modern WA groups key those
+      // by `@lid`; translating to phone JID here causes per-participant
+      // encryption to fail silently and the message only reaches our own
+      // linked devices ("solo yo lo veo" piggyback bug). Sender-side
+      // identity translation happens elsewhere (translateJid on inbound).
       const metadata = await sock.groupMetadata(jid);
-      const participants = await Promise.all(
-        metadata.participants.map(async (p) => ({
-          ...p,
-          id: await translateJid(p.id),
-        })),
-      );
-      const normalized = { ...metadata, participants };
       groupMetadataCache.set(jid, {
-        metadata: normalized,
+        metadata,
         expiresAt: Date.now() + GROUP_METADATA_CACHE_TTL_MS,
       });
-      return normalized;
+      return metadata;
     }
 
     async function syncGroupMetadata(force = false): Promise<void> {
@@ -286,6 +305,59 @@ registerChannelAdapter('whatsapp', {
         }
       } finally {
         flushing = false;
+      }
+    }
+
+    /**
+     * Local-only voice-note transcription via whisper.cpp.
+     *   - Requires WHISPER_BIN and WHISPER_MODEL env vars; if either is missing
+     *     or the model file doesn't exist, returns null and caller falls back
+     *     to a `[Voice Message]` placeholder.
+     *   - No paid OpenAI fallback by design — operator decision to keep this free.
+     *
+     * WhatsApp voice notes are OGG/Opus; whisper-cpp wants 16kHz mono WAV.
+     * ffmpeg handles the conversion (autodetects input codec). All temp
+     * files are written to os.tmpdir() and cleaned up in finally.
+     *
+     * Pattern ported from v1 src/transcription.ts.
+     */
+    async function transcribeAudioOptional(filePath: string): Promise<string | null> {
+      // systemd unit doesn't load .env, so process.env.WHISPER_BIN is undefined
+      // even when the var is in /opt/nanoclaw-v2/.env. Read it directly.
+      const env = readEnvFile(['WHISPER_BIN', 'WHISPER_MODEL', 'WHISPER_LANG']);
+      const whisperBin = env.WHISPER_BIN || process.env.WHISPER_BIN;
+      const model = env.WHISPER_MODEL || process.env.WHISPER_MODEL;
+      log.info('WhatsApp: transcribe attempt', { hasBin: !!whisperBin, hasModel: !!model });
+      if (!whisperBin || !model || !fs.existsSync(model)) {
+        log.warn('WhatsApp: whisper not configured', { whisperBin, model });
+        return null;
+      }
+
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const wavPath = path.join(os.tmpdir(), `wa-voice-${id}.wav`);
+
+      try {
+        await execFileAsync('ffmpeg', ['-i', filePath, '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath, '-y'], {
+          timeout: 30000,
+        });
+        // -l es: force Spanish language detection. Without it, whisper.cpp
+        // defaults to English and returns "(speaking in foreign language)"
+        // for Spanish audio. WHISPER_LANG env var can override.
+        const lang = env.WHISPER_LANG || process.env.WHISPER_LANG || 'es';
+        const { stdout } = await execFileAsync(
+          whisperBin,
+          ['-m', model, '-f', wavPath, '-l', lang, '--no-timestamps', '-nt'],
+          { timeout: 60000, maxBuffer: 4 * 1024 * 1024 },
+        );
+        const text = stdout.replace(/\[[^\]]*\]/g, '').trim();
+        return text || null;
+      } catch (err) {
+        log.warn('WhatsApp: whisper transcription failed', { err });
+        return null;
+      } finally {
+        try {
+          fs.unlinkSync(wavPath);
+        } catch {}
       }
     }
 
@@ -477,17 +549,25 @@ registerChannelAdapter('whatsapp', {
 
       sock.ev.on('creds.update', saveCreds);
 
-      // Phone number sharing events — update LID mapping
-      sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
-        const lidUser = lid?.split('@')[0].split(':')[0];
-        if (lidUser && jid) setLidPhoneMapping(lidUser, jid);
-      });
+      // Baileys 7.x: built-in LIDMappingStore auto-tracks lid↔pn mappings.
+      // Translation happens on-demand via signalRepository.lidMapping.getPNForLID
+      // (see translateJid). No proactive event listener needed — this matches
+      // v1's pattern. The 6.x `chats.phoneNumberShare` event was removed in 7.x.
 
       // Inbound messages
       sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
           try {
             if (!msg.message) continue;
+            // Cache the original WAMessageKey so reactToMessage can recover
+            // `participant` (required for reactions in groups).
+            if (msg.key.id) {
+              inboundKeyCache.set(msg.key.id, msg.key);
+              if (inboundKeyCache.size > INBOUND_KEY_CACHE_MAX) {
+                const oldest = inboundKeyCache.keys().next().value!;
+                inboundKeyCache.delete(oldest);
+              }
+            }
             const normalized = normalizeMessageContent(msg.message);
             if (!normalized) continue;
             const rawJid = msg.key.remoteJid;
@@ -525,18 +605,41 @@ registerChannelAdapter('whatsapp', {
             // Download media attachments (images, video, audio, documents)
             const attachments = await downloadInboundMedia(msg, normalized);
 
+            // Voice notes — transcribe (if WHISPER_BIN or OPENAI_API_KEY set)
+            // and prefix the result to content so the agent reads the words
+            // directly. Without transcription the agent only sees the file
+            // path and would have to call a tool to listen to it. Same shape
+            // as Signal v2 (PR #1962): "[Voice: <transcript>]".
+            const audioAttachment = attachments.find((a) => a.type === 'audio');
+            if (audioAttachment) {
+              const audioPath = path.join(DATA_DIR, audioAttachment.localPath);
+              const transcript = await transcribeAudioOptional(audioPath);
+              if (transcript) {
+                const voicePrefix = `[Voice: ${transcript}]`;
+                content = content ? `${voicePrefix}\n${content}` : voicePrefix;
+                log.info('WhatsApp: voice transcribed', { length: transcript.length });
+              }
+            }
+
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
 
-            const sender = msg.key.participant || msg.key.remoteJid || '';
+            // Resolve sender LID → phone JID so userId matches user_roles rows
+            // (which are keyed by canonical phone JID). The chatJid above is
+            // already translated; the sender needs the same treatment.
+            const rawSender = msg.key.participant || msg.key.remoteJid || '';
+            const sender = await translateJid(rawSender);
             const senderName = msg.pushName || sender.split('@')[0];
             const fromMe = msg.key.fromMe || false;
-            // Filter bot's own messages to prevent echo loops.
-            // fromMe is always true for messages sent from this linked device,
-            // regardless of ASSISTANT_HAS_OWN_NUMBER mode.
-            if (fromMe) continue;
-
-            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
+            // Loop-break: detect bot's own outbound echo.
+            // Dedicated number: any fromMe is the bot itself.
+            // Piggyback: all linked-device messages arrive fromMe=true (including
+            // legit self-chat), so use the ASSISTANT_NAME prefix that the send
+            // path stamps on bot output (see the prefixed branch below).
+            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
+              ? fromMe
+              : content.startsWith(`${ASSISTANT_NAME}:`);
+            if (isBotMessage) continue;
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
@@ -583,6 +686,49 @@ registerChannelAdapter('whatsapp', {
           }
         }
       });
+
+      // Inbound reactions — surface as `[Reaction: <emoji>]` messages so the
+      // agent sees when users react to its own messages. Reactions to other
+      // people's messages are ignored to keep the inbox quiet. Reaction
+      // removals (empty `reaction.text`) are also skipped.
+      // Pattern ported from v1 src/channels/whatsapp.ts.
+      sock.ev.on('messages.reaction', async (reactions) => {
+        for (const { key, reaction } of reactions) {
+          try {
+            const emoji = reaction.text || '';
+            if (!emoji) continue; // reaction was removed
+            if (reaction.key?.fromMe) continue; // skip bot's own reactions
+            if (!key.fromMe) continue; // only react to reactions on bot messages
+
+            const chatJid = await translateJid(key.remoteJid || '');
+            const rawSender = reaction.key?.participant || reaction.key?.remoteJid || '';
+            const sender = await translateJid(rawSender);
+            const senderName = sender.split('@')[0];
+            const isGroup = chatJid.endsWith('@g.us');
+
+            const inbound: InboundMessage = {
+              id: `wa-rxn-${reaction.senderTimestampMs ?? Date.now()}`,
+              kind: 'chat',
+              content: {
+                text: `[Reaction: ${emoji}]`,
+                sender,
+                senderName,
+                reactionTo: key.id,
+                fromMe: false,
+                isBotMessage: false,
+                isGroup,
+                chatJid,
+              },
+              timestamp: new Date(
+                Number(reaction.senderTimestampMs ?? Date.now()),
+              ).toISOString(),
+            };
+            setupConfig.onInbound(chatJid, null, inbound);
+          } catch (err) {
+            log.error('Error processing reaction', { err, remoteJid: key?.remoteJid });
+          }
+        }
+      });
     }
 
     // --- ChannelAdapter implementation ---
@@ -624,7 +770,7 @@ registerChannelAdapter('whatsapp', {
           const options: NormalizedOption[] = normalizeOptions(content.options as never);
 
           const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
-          const text = `*${title}*\n\n${question}\n\nReply with:\n${optionLines}`;
+          const text = `*${title}*\n\n${question}\n\nResponde con:\n${optionLines}`;
           const msgId = await sendRawMessage(platformId, text);
           if (msgId) {
             pendingQuestions.set(platformId, { questionId, options });
@@ -647,6 +793,51 @@ registerChannelAdapter('whatsapp', {
             });
           } catch (err) {
             log.debug('Failed to send reaction', { platformId, err });
+          }
+          return;
+        }
+
+        // Group subject (title) update — bot must be admin
+        if (content.operation === 'group_subject' && content.subject) {
+          try {
+            await sock.groupUpdateSubject(platformId, content.subject as string);
+            log.info('WhatsApp: group subject updated', { platformId, subject: content.subject });
+          } catch (err) {
+            log.warn('Failed to update group subject', { platformId, err });
+          }
+          return;
+        }
+
+        // Group photo/avatar update — bot must be admin. `file` is the
+        // first item of message.files (set by the MCP tool).
+        if (content.operation === 'group_photo' && message.files && message.files.length > 0) {
+          try {
+            const buffer = message.files[0].data;
+            await sock.updateProfilePicture(platformId, buffer);
+            log.info('WhatsApp: group photo updated', { platformId });
+          } catch (err) {
+            log.warn('Failed to update group photo', { platformId, err });
+          }
+          return;
+        }
+
+        // Group invite link — generate via Baileys and send as a chat
+        // message. Bot must be admin. Optional `text` is prepended.
+        if (content.operation === 'group_invite_link') {
+          try {
+            const code = await sock.groupInviteCode(platformId);
+            if (!code) {
+              log.warn('No invite code returned', { platformId });
+              return;
+            }
+            const link = `https://chat.whatsapp.com/${code}`;
+            const prefix = (content.text as string) || '';
+            const body = prefix ? `${prefix}\n${link}` : link;
+            const finalText = ASSISTANT_HAS_OWN_NUMBER ? body : `${ASSISTANT_NAME}: ${body}`;
+            await sendRawMessage(platformId, finalText);
+            log.info('WhatsApp: invite link sent', { platformId });
+          } catch (err) {
+            log.warn('Failed to get/send invite link', { platformId, err });
           }
           return;
         }
@@ -692,6 +883,26 @@ registerChannelAdapter('whatsapp', {
         }
       },
 
+      async reactToMessage(platformId: string, messageId: string, emoji: string) {
+        if (!connected) return;
+        // Identical to v1 sendReaction: { remoteJid, id, participant }
+        // with participant taken raw from the cached WAMessageKey, no
+        // translation. v1 in piggyback mode works exactly this way.
+        const cachedKey = inboundKeyCache.get(messageId);
+        const key: { remoteJid: string; id: string; participant?: string } = {
+          remoteJid: platformId,
+          id: messageId,
+        };
+        if (cachedKey?.participant) key.participant = cachedKey.participant;
+        log.info('reactToMessage', { platformId, messageId, emoji, participant: key.participant });
+        try {
+          await sock.sendMessage(platformId, { react: { text: emoji, key } });
+          log.info('reactToMessage sent', { platformId, messageId });
+        } catch (err) {
+          log.warn('Failed to react to message', { platformId, messageId, err });
+        }
+      },
+
       async teardown() {
         connected = false;
         sock?.end(undefined);
@@ -716,6 +927,58 @@ registerChannelAdapter('whatsapp', {
           log.error('Failed to sync WhatsApp conversations', { err });
           return [];
         }
+      },
+
+      async createGroup(subject: string): Promise<{ platformId: string; inviteLink: string | null }> {
+        if (!connected || !sock) {
+          throw new Error('WhatsApp adapter is not connected');
+        }
+        const meta = await sock.groupCreate(subject, []);
+        const platformId = meta.id;
+        // Defensive: groupCreate normally returns @g.us — flag if WA changes
+        // and we get @lid (would force a translateJid follow-up before we can
+        // wire it).
+        if (!platformId.endsWith('@g.us')) {
+          log.warn('groupCreate returned non-@g.us platform_id', { platformId });
+        }
+        let inviteLink: string | null = null;
+        try {
+          const code = await sock.groupInviteCode(platformId);
+          if (code) inviteLink = `https://chat.whatsapp.com/${code}`;
+        } catch (err) {
+          log.warn('groupInviteCode failed after groupCreate', { platformId, err });
+        }
+        log.info('WhatsApp group created', { platformId, subject, hasInvite: inviteLink !== null });
+        return { platformId, inviteLink };
+      },
+
+      async getInviteLink(platformId: string): Promise<string | null> {
+        if (!connected || !sock) {
+          throw new Error('WhatsApp adapter is not connected');
+        }
+        try {
+          const code = await sock.groupInviteCode(platformId);
+          return code ? `https://chat.whatsapp.com/${code}` : null;
+        } catch (err) {
+          log.warn('groupInviteCode failed', { platformId, err });
+          return null;
+        }
+      },
+
+      async leaveGroup(platformId: string): Promise<void> {
+        if (!connected || !sock) {
+          throw new Error('WhatsApp adapter is not connected');
+        }
+        await sock.groupLeave(platformId);
+        log.info('WhatsApp group left', { platformId });
+      },
+
+      async renameGroup(platformId: string, newName: string): Promise<void> {
+        if (!connected || !sock) {
+          throw new Error('WhatsApp adapter is not connected');
+        }
+        await sock.groupUpdateSubject(platformId, newName);
+        log.info('WhatsApp group renamed', { platformId, newName });
       },
     };
 
