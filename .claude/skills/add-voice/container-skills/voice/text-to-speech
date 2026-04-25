@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# text-to-speech: convert text to audio using ElevenLabs (primary) or OpenAI (fallback)
+# Usage: text-to-speech "text to speak" [voice-name]
+# Voices: antonio (default), jc, brian, daniel, enrique, maya, cristina, regina, custom
+#
+# Auth is handled by OneCLI — the HTTPS_PROXY rewrites xi-api-key (ElevenLabs)
+# and Authorization (OpenAI) headers. Always pass placeholder values.
+set -euo pipefail
+
+TEXT="${1:?Usage: text-to-speech \"text\" [voice-name]}"
+VOICE_NAME="${2:-antonio}"
+OUTPUT_DIR="/workspace/agent"
+OUTPUT_FILE="${OUTPUT_DIR}/tts-$(date +%s%3N).ogg"
+
+declare -A VOICES=(
+  [antonio]="htFfPSZGJwjBv1CL0aMD"
+  [jc]="4XUsiqPDK4UACIM2BILe"
+  [brian]="XgQWNZcJ8SRkxXwwhPTo"
+  [daniel]="T7BErSAR6r6NDaGdTLKB"
+  [enrique]="gbTn1bmCvNgk0QEAVyfM"
+  [maya]="nbcvT3C2tyOd2OsRAtUf"
+  [cristina]="nTkjq09AuYgsNR8E4sDe"
+  [regina]="9Godp7dNohUvXk6qp0gS"
+)
+
+VOICE_CONFIG="/workspace/agent/voice_config.json"
+if [[ "$VOICE_NAME" == "custom" || "$VOICE_NAME" == "cloned" ]] && [[ -f "$VOICE_CONFIG" ]]; then
+  VOICE_ID=$(python3 -c "import json; print(json.load(open('$VOICE_CONFIG')).get('voice_id',''))" 2>/dev/null || true)
+elif [[ -n "${VOICES[$VOICE_NAME]+x}" ]]; then
+  VOICE_ID="${VOICES[$VOICE_NAME]}"
+else
+  VOICE_ID="${VOICES[antonio]}"
+  echo "WARNING: Unknown voice '$VOICE_NAME', using antonio" >&2
+fi
+
+# --- ElevenLabs (primary) ---
+if [[ -n "${VOICE_ID:-}" ]]; then
+  RESPONSE_CODE=$(curl -sS -w "%{http_code}" -o "$OUTPUT_FILE" \
+    -X POST "https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}?output_format=opus_48000_64" \
+    -H "xi-api-key: placeholder" \
+    -H "Content-Type: application/json" \
+    -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+    'text': sys.argv[1],
+    'model_id': 'eleven_multilingual_v2',
+    'voice_settings': {
+        'stability': 0.35,
+        'similarity_boost': 0.85,
+        'style': 0.6,
+        'use_speaker_boost': True
+    }
+}))
+" "$TEXT")")
+
+  if [[ "$RESPONSE_CODE" == "200" ]]; then
+    echo "$OUTPUT_FILE"
+    exit 0
+  else
+    ERROR=$(cat "$OUTPUT_FILE" 2>/dev/null || echo "HTTP $RESPONSE_CODE")
+    rm -f "$OUTPUT_FILE"
+    echo "WARNING: ElevenLabs failed ($RESPONSE_CODE), falling back to OpenAI TTS" >&2
+    echo "$ERROR" >&2
+  fi
+fi
+
+# --- OpenAI fallback ---
+VOICE="onyx"
+RESPONSE_CODE=$(curl -sS -w "%{http_code}" -o "$OUTPUT_FILE" \
+  -X POST "https://api.openai.com/v1/audio/speech" \
+  -H "Authorization: Bearer placeholder" \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': 'tts-1-hd',
+    'input': sys.argv[1],
+    'voice': sys.argv[2],
+    'response_format': 'opus'
+}))
+" "$TEXT" "$VOICE")")
+
+if [[ "$RESPONSE_CODE" != "200" ]]; then
+  ERROR=$(cat "$OUTPUT_FILE" 2>/dev/null || echo "HTTP $RESPONSE_CODE")
+  rm -f "$OUTPUT_FILE"
+  echo "ERROR: OpenAI TTS: $ERROR" >&2
+  exit 1
+fi
+
+echo "$OUTPUT_FILE"

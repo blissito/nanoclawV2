@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# generate-gif: create animated GIFs (free modes — ffmpeg local)
+# Usage:
+#   generate-gif img1.png img2.png img3.png                    # slideshow from multiple images
+#   generate-gif --crop WxH+X+Y /path/to/img.png               # crop region and convert to GIF
+#   generate-gif --convert /path/to/img.avif                    # convert image to GIF as-is
+#   generate-gif --sprite COLSxROWS [--fps N] [--format gif|webp|mp4] sprite.png  # animate sprite sheet
+set -euo pipefail
+
+OUTPUT_DIR="/workspace/agent"
+OUTPUT_FILE="${OUTPUT_DIR}/gif-$(date +%s%3N).gif"
+
+# --- Mode: Crop + GIF ---
+if [[ "${1:-}" == "--crop" ]]; then
+  shift
+  CROP_SPEC="${1:?Usage: generate-gif --crop WxH+X+Y /path/to/image.png}"
+  shift
+  SOURCE_IMAGE="${1:?Usage: generate-gif --crop WxH+X+Y /path/to/image.png}"
+
+  if [[ ! -f "$SOURCE_IMAGE" ]]; then
+    echo "ERROR: File not found: $SOURCE_IMAGE" >&2
+    exit 1
+  fi
+
+  CROP_FILTER=$(python3 -c "
+import re, sys
+s = sys.argv[1]
+m = re.match(r'(\d+)x(\d+)\+(\d+)\+(\d+)', s)
+if not m:
+    print(f'ERROR: Invalid crop spec: {s}. Use WxH+X+Y (e.g. 300x400+50+100)', file=sys.stderr)
+    sys.exit(1)
+w, h, x, y = m.groups()
+print(f'crop={w}:{h}:{x}:{y}')
+" "$CROP_SPEC")
+
+  PALETTE="${OUTPUT_DIR}/.tmp-palette-$$.png"
+  ffmpeg -y -i "$SOURCE_IMAGE" -vf "${CROP_FILTER},scale=480:-1:flags=lanczos,palettegen" "$PALETTE" 2>/dev/null
+  ffmpeg -y -i "$SOURCE_IMAGE" -i "$PALETTE" -lavfi "${CROP_FILTER},scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse" "$OUTPUT_FILE" 2>/dev/null
+  rm -f "$PALETTE"
+
+  echo "$OUTPUT_FILE"
+  exit 0
+fi
+
+# --- Mode: Convert to GIF ---
+if [[ "${1:-}" == "--convert" ]]; then
+  shift
+  SOURCE_IMAGE="${1:?Usage: generate-gif --convert /path/to/image.png}"
+
+  if [[ ! -f "$SOURCE_IMAGE" ]]; then
+    echo "ERROR: File not found: $SOURCE_IMAGE" >&2
+    exit 1
+  fi
+
+  PALETTE="${OUTPUT_DIR}/.tmp-palette-$$.png"
+  ffmpeg -y -i "$SOURCE_IMAGE" -vf "scale=480:-1:flags=lanczos,palettegen" "$PALETTE" 2>/dev/null
+  ffmpeg -y -i "$SOURCE_IMAGE" -i "$PALETTE" -lavfi "scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse" "$OUTPUT_FILE" 2>/dev/null
+  rm -f "$PALETTE"
+
+  echo "$OUTPUT_FILE"
+  exit 0
+fi
+
+# --- Mode: Sprite sheet ---
+if [[ "${1:-}" == "--sprite" ]]; then
+  shift
+  GRID="${1:?Usage: generate-gif --sprite COLSxROWS [--fps N] [--format gif|webp|mp4] sprite.png}"
+  shift
+
+  FPS=10
+  FORMAT="gif"
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --fps) shift; FPS="${1:?--fps requires a number}"; shift ;;
+      --format) shift; FORMAT="${1:?--format requires gif|webp|mp4}"; shift ;;
+      *) echo "ERROR: Unknown flag: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  SOURCE_IMAGE="${1:?Missing sprite sheet image path}"
+  if [[ ! -f "$SOURCE_IMAGE" ]]; then
+    echo "ERROR: File not found: $SOURCE_IMAGE" >&2
+    exit 1
+  fi
+
+  COLS=$(echo "$GRID" | cut -dx -f1)
+  ROWS=$(echo "$GRID" | cut -dx -f2)
+  if [[ -z "$COLS" || -z "$ROWS" || "$COLS" -lt 1 || "$ROWS" -lt 1 ]]; then
+    echo "ERROR: Invalid grid: $GRID. Use COLSxROWS (e.g. 4x3)" >&2
+    exit 1
+  fi
+
+  DIMS=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$SOURCE_IMAGE")
+  IMG_W=$(echo "$DIMS" | cut -d, -f1)
+  IMG_H=$(echo "$DIMS" | cut -d, -f2)
+  FRAME_W=$((IMG_W / COLS))
+  FRAME_H=$((IMG_H / ROWS))
+
+  TMP_DIR="${OUTPUT_DIR}/.tmp-sprite-$$"
+  mkdir -p "$TMP_DIR"
+
+  FRAME_NUM=0
+  for row in $(seq 0 $((ROWS - 1))); do
+    for col in $(seq 0 $((COLS - 1))); do
+      X=$((col * FRAME_W))
+      Y=$((row * FRAME_H))
+      FRAME_FILE=$(printf "%s/frame-%04d.png" "$TMP_DIR" "$FRAME_NUM")
+      ffmpeg -y -i "$SOURCE_IMAGE" -vf "crop=${FRAME_W}:${FRAME_H}:${X}:${Y}" "$FRAME_FILE" 2>/dev/null
+      FRAME_NUM=$((FRAME_NUM + 1))
+    done
+  done
+
+  case "$FORMAT" in
+    gif)
+      OUTPUT_FILE="${OUTPUT_DIR}/sprite-$(date +%s%3N).gif"
+      PALETTE="${TMP_DIR}/palette.png"
+      ffmpeg -y -framerate "$FPS" -i "${TMP_DIR}/frame-%04d.png" -vf "scale=480:-1:flags=lanczos,palettegen" "$PALETTE" 2>/dev/null
+      ffmpeg -y -framerate "$FPS" -i "${TMP_DIR}/frame-%04d.png" -i "$PALETTE" -lavfi "scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse" -loop 0 "$OUTPUT_FILE" 2>/dev/null
+      ;;
+    webp)
+      OUTPUT_FILE="${OUTPUT_DIR}/sprite-$(date +%s%3N).webp"
+      ffmpeg -y -framerate "$FPS" -i "${TMP_DIR}/frame-%04d.png" -vf "scale=480:-1:flags=lanczos" -c:v libwebp -lossless 0 -q:v 80 -loop 0 "$OUTPUT_FILE" 2>/dev/null
+      ;;
+    mp4)
+      OUTPUT_FILE="${OUTPUT_DIR}/sprite-$(date +%s%3N).mp4"
+      ffmpeg -y -framerate "$FPS" -i "${TMP_DIR}/frame-%04d.png" -vf "scale=480:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p -movflags +faststart "$OUTPUT_FILE" 2>/dev/null
+      ;;
+    *)
+      echo "ERROR: Unknown format: $FORMAT. Use gif, webp, or mp4" >&2
+      rm -rf "$TMP_DIR"
+      exit 1
+      ;;
+  esac
+
+  rm -rf "$TMP_DIR"
+
+  echo "$OUTPUT_FILE"
+  exit 0
+fi
+
+# --- Mode: Slideshow ---
+if [[ $# -lt 2 ]]; then
+  echo "Usage: generate-gif img1 img2 [img3 ...]   (slideshow)" >&2
+  echo "       generate-gif --crop WxH+X+Y img.png" >&2
+  echo "       generate-gif --convert img.png" >&2
+  echo "       generate-gif --sprite COLSxROWS [--fps N] [--format gif|webp|mp4] sprite.png" >&2
+  exit 1
+fi
+
+TMP_LIST="${OUTPUT_DIR}/.tmp-giflist-$$.txt"
+for img in "$@"; do
+  if [[ ! -f "$img" ]]; then
+    echo "ERROR: File not found: $img" >&2
+    exit 1
+  fi
+  echo "file '${img}'" >> "$TMP_LIST"
+  echo "duration 1" >> "$TMP_LIST"
+done
+echo "file '${!#}'" >> "$TMP_LIST"
+
+PALETTE="${OUTPUT_DIR}/.tmp-palette-$$.png"
+ffmpeg -y -f concat -safe 0 -i "$TMP_LIST" -vf "scale=480:-1:flags=lanczos,palettegen" "$PALETTE" 2>/dev/null
+ffmpeg -y -f concat -safe 0 -i "$TMP_LIST" -i "$PALETTE" -lavfi "scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse" -loop 0 "$OUTPUT_FILE" 2>/dev/null
+rm -f "$TMP_LIST" "$PALETTE"
+
+echo "$OUTPUT_FILE"

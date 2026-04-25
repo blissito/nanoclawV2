@@ -79,6 +79,16 @@ async function main(): Promise<void> {
       args: ['run', mcpServerPath],
       env: {},
     },
+    easybits: {
+      command: 'npx',
+      args: ['-y', '@easybits.cloud/mcp'],
+      env: { EASYBITS_API_KEY: 'placeholder' },
+    },
+    brightdata: {
+      command: 'npx',
+      args: ['-y', '@brightdata/mcp'],
+      env: { API_TOKEN: 'placeholder' },
+    },
   };
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {

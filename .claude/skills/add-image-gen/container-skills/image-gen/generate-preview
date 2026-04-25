@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# generate-preview: image generation via OpenAI gpt-image-1
+# Usage: generate-preview "prompt"              # low quality, cheap ($0.011)
+#        generate-preview --hd "prompt"          # high quality ($0.04)
+#
+# Auth is handled by OneCLI — the HTTPS_PROXY rewrites the Authorization
+# header at api.openai.com. Always pass `Bearer placeholder`.
+set -euo pipefail
+
+MODEL="gpt-image-1"
+QUALITY="low"
+if [[ "${1:-}" == "--hd" ]]; then
+  QUALITY="high"
+  shift
+fi
+
+PROMPT="${1:?Usage: generate-preview [--hd] \"prompt\"}"
+OUTPUT_DIR="/workspace/agent"
+OUTPUT_FILE="${OUTPUT_DIR}/preview-$(date +%s%3N).png"
+
+PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': sys.argv[1],
+    'prompt': sys.argv[2],
+    'quality': sys.argv[3],
+    'size': '1024x1024'
+}))
+" "$MODEL" "$PROMPT" "$QUALITY")
+
+RESPONSE=$(curl -sS -X POST "https://api.openai.com/v1/images/generations" \
+  -H "Authorization: Bearer placeholder" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+ERROR=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+e = d.get('error', {})
+if isinstance(e, dict) and e.get('message'):
+    print(e['message'])
+" <<< "$RESPONSE" 2>/dev/null || true)
+
+if [[ -n "$ERROR" ]]; then
+  echo "ERROR: OpenAI API: $ERROR" >&2
+  exit 1
+fi
+
+python3 -c "
+import json, sys, base64
+d = json.load(sys.stdin)
+b64 = d['data'][0]['b64_json']
+with open(sys.argv[1], 'wb') as f:
+    f.write(base64.b64decode(b64))
+" "$OUTPUT_FILE" <<< "$RESPONSE"
+
+echo "$OUTPUT_FILE"
