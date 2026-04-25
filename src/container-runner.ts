@@ -20,6 +20,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import { readEnvFile } from './env.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -255,6 +256,16 @@ function buildMounts(
   // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
 
+  // Channel attachments at /workspace/attachments (RO). Channel adapters
+  // (WhatsApp, etc.) download inbound media to ${DATA_DIR}/attachments/ and
+  // emit `localPath: "attachments/<file>"`; the formatter resolves that to
+  // `/workspace/<localPath>`, so the container needs the dir mounted there.
+  // Without this, agents see the path in message text but cannot read the file.
+  const attachmentsDir = path.join(DATA_DIR, 'attachments');
+  if (fs.existsSync(attachmentsDir)) {
+    mounts.push({ hostPath: attachmentsDir, containerPath: '/workspace/attachments', readonly: true });
+  }
+
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
@@ -426,6 +437,19 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // External MCP servers that read auth from env vars at startup (BrightData,
+  // EasyBits, etc.) cannot use OneCLI — OneCLI only injects credentials into
+  // HTTPS request headers, not into env vars. Read those keys from the host
+  // .env explicitly and pass them through. v1 had these in process.env; v2's
+  // env.ts does not auto-load .env, so we hand-pick the ones we need.
+  const passthroughEnv = readEnvFile([
+    'BRIGHTDATA_API_TOKEN',
+    'EASYBITS_API_KEY',
+  ]);
+  for (const [key, value] of Object.entries(passthroughEnv)) {
+    if (value) args.push('-e', `${key}=${value}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

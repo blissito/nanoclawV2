@@ -82,12 +82,26 @@ async function main(): Promise<void> {
     easybits: {
       command: 'npx',
       args: ['-y', '@easybits.cloud/mcp'],
-      env: { EASYBITS_API_KEY: 'placeholder' },
+      env: { EASYBITS_API_KEY: process.env.EASYBITS_API_KEY || '' },
     },
     brightdata: {
       command: 'npx',
       args: ['-y', '@brightdata/mcp'],
-      env: { API_TOKEN: 'placeholder' },
+      env: {
+        // BrightData MCP reads API_TOKEN from env at startup (it's not an
+        // HTTP-injected credential), so OneCLI's gateway can't supply it.
+        API_TOKEN: process.env.BRIGHTDATA_API_TOKEN || '',
+        // GROUPS gates which tool families BrightData exposes. Without
+        // `social`, LinkedIn/X/IG scraping returns 400. Match v1's set.
+        GROUPS: 'geo,social,business,ecommerce,finance',
+        // Bypass OneCLI MITM proxy for BrightData API. The MCP MUST connect
+        // directly to api.brightdata.com — going through OneCLI's self-signed
+        // cert breaks SSL handshake (NODE_EXTRA_CA_CERTS file not always
+        // present). v1 ran without proxy entirely; this matches that behavior
+        // for just the BD endpoints while preserving proxy for other traffic.
+        NO_PROXY: 'api.brightdata.com,brightdata.com',
+        no_proxy: 'api.brightdata.com,brightdata.com',
+      },
     },
   };
 
