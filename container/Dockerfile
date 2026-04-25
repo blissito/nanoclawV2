@@ -51,6 +51,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         git \
         tini \
         unzip \
+        ffmpeg \
+        yt-dlp \
+        python3 \
+        python3-pip \
+        poppler-utils \
+        imagemagick \
+        libreoffice-calc \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
@@ -62,6 +69,24 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# ---- GitHub CLI (gh) ---------------------------------------------------------
+# Adds the official packages.github.com repo, then installs gh.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Deno --------------------------------------------------------------------
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# ---- Python extras (openpyxl, pandas) ----------------------------------------
+# yt-dlp is already installed via apt above.
+RUN pip3 install --break-system-packages --no-cache-dir openpyxl pandas
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
@@ -103,6 +128,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# ---- v1 parity: extra global Node CLIs ---------------------------------------
+# Pinned versions (>3 days old per pnpm minimumReleaseAge policy).
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g \
+        panel-mcp@0.1.2 \
+        smatch-mcp@1.7.2 \
+        smatch-mcp-public@1.0.2 \
+        pptxgenjs@4.0.1
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
