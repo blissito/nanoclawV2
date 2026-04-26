@@ -31,10 +31,12 @@ import Database from 'better-sqlite3';
 import { GROUPS_DIR } from './config.js';
 import { log } from './log.js';
 import { getDb } from './db/connection.js';
-import { getAgentGroup } from './db/agent-groups.js';
+import { getAgentGroup, updateAgentGroup } from './db/agent-groups.js';
 import { getMessagingGroupAgents } from './db/messaging-groups.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { inboundDbPath, outboundDbPath } from './session-manager.js';
+import { CONTAINER_RUNTIME_BIN, stopContainer } from './container-runtime.js';
+import { getUser } from './modules/permissions/db/users.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
 const DEFAULT_PORT = 8787;
@@ -189,16 +191,85 @@ function previewContent(raw: string): string {
   return raw.slice(0, 500);
 }
 
-function senderNameFromInboundContent(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw) as { sender?: string; author?: { fullName?: string; userName?: string } };
-    return parsed.sender || parsed.author?.fullName || parsed.author?.userName || 'unknown';
-  } catch {
-    return 'unknown';
-  }
+interface InboundContent {
+  sender?: string;
+  author?: { fullName?: string; userName?: string; userId?: string };
+  senderId?: string;
 }
 
-function activityFor(agentGroupId: string, mgId: string): ActivityResponse {
+/**
+ * Resolve a friendly name for the inbound message author. Order:
+ *   1. Real names from chat-sdk content (author.fullName / author.userName).
+ *   2. users.display_name lookup against the JID we can dig out of the
+ *      content (senderId, author.userId, or `sender` when it looks like a
+ *      JID, not a name). The `whatsapp` adapter writes `content.sender` as
+ *      the raw JID, so a JID-shaped `sender` MUST go through user lookup
+ *      before being returned verbatim.
+ *   3. Pretty-printed JID (strip `@s.whatsapp.net`, etc.).
+ *   4. `content.sender` if it didn't look like a JID (unlikely, defensive).
+ *   5. Literal "unknown".
+ */
+function resolveInboundSenderName(raw: string, channelType: string | null): string {
+  let parsed: InboundContent = {};
+  try { parsed = JSON.parse(raw) as InboundContent; } catch { /* */ }
+
+  const realName = parsed.author?.fullName || parsed.author?.userName;
+  if (realName) return realName;
+
+  const candidates = [parsed.senderId, parsed.author?.userId, parsed.sender].filter(
+    (s): s is string => typeof s === 'string' && s.length > 0,
+  );
+  for (const c of candidates) {
+    if (!looksLikeJid(c)) continue;
+    if (channelType) {
+      const userId = c.includes(':') ? c : `${channelType}:${c}`;
+      try {
+        const user = getUser(userId);
+        if (user?.display_name) return user.display_name;
+      } catch { /* DB issue — fall through to pretty-print */ }
+    }
+    return prettyJid(c);
+  }
+
+  // Last-resort: a `sender` value that didn't look like a JID is presumably
+  // already a name (legacy adapters).
+  if (parsed.sender) return parsed.sender;
+  return 'unknown';
+}
+
+function looksLikeJid(s: string): boolean {
+  // "12345@s.whatsapp.net", "abc@g.us", "telegram:123", etc.
+  return s.includes('@') || /^[a-z]+:[A-Za-z0-9._-]+/.test(s);
+}
+
+function prettyJid(jid: string): string {
+  // "5217712412825@s.whatsapp.net" → "+5217712412825"; "12345@g.us" → "12345"
+  const at = jid.indexOf('@');
+  const local = at === -1 ? jid : jid.slice(0, at);
+  return /^\d+$/.test(local) ? `+${local}` : local;
+}
+
+/**
+ * Normalize a SQLite-emitted timestamp to ISO 8601.
+ *
+ * inbound.db rows: `datetime('now')` from the host stores `"YYYY-MM-DD HH:MM:SS"`
+ * (UTC, no Z). The agent-runner uses the same default in outbound.db. Other
+ * callers may insert full ISO with offset. Both must come out as ISO so the
+ * dashboard parses with one `new Date(s)`.
+ */
+function normalizeTimestamp(s: string | null | undefined): string | null {
+  if (!s) return null;
+  // Already ISO?
+  if (s.includes('T')) {
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? s : d.toISOString();
+  }
+  // SQLite "YYYY-MM-DD HH:MM:SS" — treat as UTC.
+  const d = new Date(s.replace(' ', 'T') + 'Z');
+  return Number.isNaN(d.getTime()) ? s : d.toISOString();
+}
+
+function activityFor(agentGroupId: string, mgId: string, channelType: string | null): ActivityResponse {
   const empty: ActivityResponse = {
     lastMessageAt: null,
     lastMessage: null,
@@ -212,8 +283,9 @@ function activityFor(agentGroupId: string, mgId: string): ActivityResponse {
     const sessions = getSessionsByAgentGroup(agentGroupId).filter((s) => s.messaging_group_id === mgId);
     if (sessions.length === 0) return empty;
 
-    const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-    const since7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const nowMs = Date.now();
+    const since24hMs = nowMs - 24 * 3600 * 1000;
+    const since7dMs = nowMs - 7 * 24 * 3600 * 1000;
 
     let count24h = 0;
     let count7d = 0;
@@ -232,16 +304,20 @@ function activityFor(agentGroupId: string, mgId: string): ActivityResponse {
             "SELECT id, content, timestamp FROM messages_in WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
           ).all() as Array<{ id: string; content: string; timestamp: string }>;
           for (const r of inRows) {
+            const iso = normalizeTimestamp(r.timestamp) ?? r.timestamp;
+            const tsMs = Date.parse(iso);
             all.push({
               id: r.id,
-              senderName: senderNameFromInboundContent(r.content),
+              senderName: resolveInboundSenderName(r.content, channelType),
               content: previewContent(r.content),
-              timestamp: r.timestamp,
+              timestamp: iso,
               isFromBot: false,
               isFromMe: false,
             });
-            if (r.timestamp > since24h) count24h++;
-            if (r.timestamp > since7d) count7d++;
+            if (Number.isFinite(tsMs)) {
+              if (tsMs > since24hMs) count24h++;
+              if (tsMs > since7dMs) count7d++;
+            }
           }
         } finally {
           inDb.close();
@@ -256,18 +332,22 @@ function activityFor(agentGroupId: string, mgId: string): ActivityResponse {
             "SELECT id, content, timestamp FROM messages_out WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
           ).all() as Array<{ id: string; content: string; timestamp: string }>;
           for (const r of outRows) {
+            const iso = normalizeTimestamp(r.timestamp) ?? r.timestamp;
+            const tsMs = Date.parse(iso);
             all.push({
               id: r.id,
               senderName: 'bot',
               content: previewContent(r.content),
-              timestamp: r.timestamp,
+              timestamp: iso,
               isFromBot: true,
               isFromMe: true,
             });
-            if (r.timestamp > since24h) count24h++;
-            if (r.timestamp > since7d) count7d++;
-            if (!lastBot || r.timestamp > lastBot.timestamp) {
-              lastBot = { content: previewContent(r.content), timestamp: r.timestamp };
+            if (Number.isFinite(tsMs)) {
+              if (tsMs > since24hMs) count24h++;
+              if (tsMs > since7dMs) count7d++;
+            }
+            if (!lastBot || iso > lastBot.timestamp) {
+              lastBot = { content: previewContent(r.content), timestamp: iso };
             }
           }
         } finally {
@@ -297,19 +377,19 @@ function activityFor(agentGroupId: string, mgId: string): ActivityResponse {
 
 // ── Container logs ────────────────────────────────────────────────────────
 
-function tailDockerLogs(agentGroupId: string, lines: number): string {
-  const ps = spawnSync('docker', [
+function tailContainerLogs(agentGroupId: string, lines: number): string {
+  const ps = spawnSync(CONTAINER_RUNTIME_BIN, [
     'ps', '--filter', `label=nanoclaw-agent-group-id=${agentGroupId}`, '--format', '{{.Names}}',
   ], { encoding: 'utf8' });
   if (ps.status !== 0) return '';
   const name = (ps.stdout || '').trim().split('\n')[0];
   if (!name) return '';
 
-  const logs = spawnSync('docker', ['logs', '--tail', String(lines), name], {
+  const logs = spawnSync(CONTAINER_RUNTIME_BIN, ['logs', '--tail', String(lines), name], {
     encoding: 'utf8',
     maxBuffer: 8 * 1024 * 1024,
   });
-  // docker logs writes both stdout (app stdout) and stderr (app stderr) — concat.
+  // `logs` writes both stdout (app stdout) and stderr (app stderr) — concat.
   return (logs.stdout || '') + (logs.stderr || '');
 }
 
@@ -406,7 +486,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
 
     // GET /admin/agents/:jid/activity
     if (method === 'GET' && parts.length === 4 && parts[3] === 'activity') {
-      send(res, 200, activityFor(resolved.agentGroup.id, resolved.mg.id));
+      send(res, 200, activityFor(resolved.agentGroup.id, resolved.mg.id, resolved.mg.channel_type));
       return;
     }
 
@@ -414,7 +494,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
     if (method === 'GET' && parts.length === 4 && parts[3] === 'logs') {
       const requested = Number(url.searchParams.get('tail') ?? 200);
       const tail = Math.min(Math.max(Number.isFinite(requested) ? requested : 200, 1), 1000);
-      send(res, 200, { logs: tailDockerLogs(resolved.agentGroup.id, tail) });
+      send(res, 200, { logs: tailContainerLogs(resolved.agentGroup.id, tail) });
       return;
     }
 
@@ -428,7 +508,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
         return;
       }
 
-      const allowed = ['trigger', 'requiresTrigger', 'mcpServers', 'claudeMd'] as const;
+      const allowed = ['name', 'trigger', 'requiresTrigger', 'mcpServers', 'claudeMd'] as const;
       const supplied = allowed.filter((k) => k in body);
       if (supplied.length === 0) {
         send(res, 400, { error: 'no_supported_fields', allowed });
@@ -438,6 +518,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
       const ignored: string[] = [];
       let touchedFiles = false;
       let touchedDb = false;
+
+      // name → agent_groups.name (display name shown in dashboard list)
+      if (typeof body.name === 'string') {
+        updateAgentGroup(resolved.agentGroup.id, { name: body.name });
+        touchedDb = true;
+      }
 
       // trigger → container.json.assistantName (closest analog in v2)
       if (typeof body.trigger === 'string') {
@@ -474,25 +560,38 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
 
       // If anything in container.json or CLAUDE.local.md changed, kill the
       // running container so the next message wakes a fresh one with the
-      // composed CLAUDE.md regenerated. DB-only changes (engage_mode) are
-      // read by the host router on every message — no restart needed.
+      // composed CLAUDE.md regenerated. DB-only changes (engage_mode, name)
+      // are read by the host on every message — no restart needed.
+      let restartedContainer = false;
       if (touchedFiles) {
-        spawnSync(
-          'sh',
-          [
-            '-c',
-            `docker ps --filter label=nanoclaw-agent-group-id=${resolved.agentGroup.id} --format '{{.Names}}' | xargs -r docker stop >/dev/null 2>&1`,
-          ],
-          { encoding: 'utf8' },
-        );
+        const ps = spawnSync(CONTAINER_RUNTIME_BIN, [
+          'ps', '--filter', `label=nanoclaw-agent-group-id=${resolved.agentGroup.id}`, '--format', '{{.Names}}',
+        ], { encoding: 'utf8' });
+        const name = (ps.stdout || '').trim().split('\n').filter(Boolean)[0];
+        if (name) {
+          try {
+            stopContainer(name);
+            restartedContainer = true;
+          } catch (e) {
+            log.warn('Admin PATCH: failed to stop container', { name, err: e instanceof Error ? e.message : String(e) });
+          }
+        }
       }
+
+      // Echo the fresh detail so the dashboard doesn't have to re-fetch.
+      const fresh = resolveJid(jid);
+      const container = fresh ? readContainerConfig(fresh.agentGroup.folder) : null;
+      const detail: DropletAgentDetail | null = fresh
+        ? { ...publicAgent(jid, fresh, container), containerConfig: container, claudeMd: readClaudeMd(fresh.agentGroup.folder) }
+        : null;
 
       send(res, 200, {
         ok: true,
         applied: supplied.filter((k) => !ignored.some((i) => i.startsWith(k))),
         ignored,
-        restarted_container: touchedFiles,
+        restarted_container: restartedContainer,
         db_updated: touchedDb,
+        detail,
       });
       return;
     }
@@ -513,6 +612,15 @@ export function startAdminServer(): void {
   }
 
   server = http.createServer((req, res) => {
+    const startedAt = Date.now();
+    res.on('finish', () => {
+      log.info('admin', {
+        method: req.method,
+        path: (req.url ?? '').split('?')[0],
+        status: res.statusCode,
+        ms: Date.now() - startedAt,
+      });
+    });
     handle(req, res, cfg).catch((err) => {
       log.error('Admin handler threw', { url: req.url, err });
       try {
