@@ -66,6 +66,7 @@ WorkingDirectory=${projectRoot}
 Restart=always
 RestartSec=5
 KillMode=process
+EnvironmentFile=-${projectRoot}/.env
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
@@ -164,6 +165,17 @@ describe('systemd unit generation', () => {
     expect(unit).toContain(
       'ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js',
     );
+  });
+
+  it('sources .env via EnvironmentFile so host code (admin-server, usage-reporter) sees NANOCLAW_ADMIN_TOKEN etc.', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/srv/nanoclaw',
+      '/home/user',
+      false,
+    );
+    // Leading `-` makes the file optional (no error if .env doesn't exist).
+    expect(unit).toContain('EnvironmentFile=-/srv/nanoclaw/.env');
   });
 });
 
