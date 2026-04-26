@@ -86,19 +86,31 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
+  /** First triggering user's namespaced id (e.g. "whatsapp:521...@s.whatsapp.net"). */
+  senderId: string | null;
 }
 
 /**
  * Extract routing context from a batch of messages.
- * Uses the first message's routing fields.
+ * Uses the first message's routing fields. `senderId` is read from the first
+ * message that has one (host-injected/system rows may have none).
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const first = messages[0];
+  let senderId: string | null = null;
+  for (const m of messages) {
+    const sid = extractSenderId(m, parseContent(m.content));
+    if (sid) {
+      senderId = sid;
+      break;
+    }
+  }
   return {
     platformId: first?.platform_id ?? null,
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
+    senderId,
   };
 }
 

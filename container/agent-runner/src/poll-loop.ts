@@ -6,6 +6,8 @@ import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/co
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { loadConfig } from './config.js';
+import { reportTurnUsage } from './usage-reporter.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -274,6 +276,17 @@ interface QueryResult {
   continuation?: string;
 }
 
+function currentMaxOutboundSeq(): number {
+  try {
+    const row = getOutboundDb()
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out')
+      .get() as { m: number };
+    return row.m;
+  } catch {
+    return 0;
+  }
+}
+
 async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
@@ -281,6 +294,11 @@ async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  // Snapshot before this turn so we can detect whether the turn produced any
+  // user-visible messages_out row (final reply OR mid-turn send_message MCP).
+  // If MAX(seq) didn't move past this, the turn was tool-only — skip usage
+  // reporting rather than fabricating an idempotency key.
+  let lastReportedSeq = currentMaxOutboundSeq();
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
@@ -344,6 +362,28 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+        // Best-effort token-usage report. Only if the turn wrote at least
+        // one messages_out row (otherwise it was tool-only with no visible
+        // output → no idempotency anchor). Awaited but capped at 5s by the
+        // reporter; logged-and-swallowed on any failure.
+        const newMax = currentMaxOutboundSeq();
+        if (newMax > lastReportedSeq && event.usage && queryContinuation) {
+          try {
+            await reportTurnUsage({
+              agentGroupId: loadConfig().agentGroupId,
+              sessionId: queryContinuation,
+              turnIdempotencyKey: `${queryContinuation}:${newMax}`,
+              model: event.model || 'unknown',
+              usage: event.usage,
+              occurredAt: new Date(),
+              userId: routing.senderId ?? undefined,
+              messagingGroupId: routing.platformId ?? undefined,
+            });
+          } catch (e) {
+            console.error(`[poll-loop] usage report unexpected throw: ${e instanceof Error ? e.message : String(e)}`);
+          }
+          lastReportedSeq = newMax;
         }
         // Tool-armed restart: now that the user-facing message has been
         // dispatched, it's safe to exit so the next inbound message wakes a
