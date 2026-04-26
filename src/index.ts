@@ -16,6 +16,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { startAdminServer, stopAdminServer } from './admin-server.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -169,6 +170,9 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Admin HTTP API for ghosty-studio (8787 by default)
+  startAdminServer();
+
   log.info('NanoClaw running');
 }
 
@@ -184,6 +188,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  await stopAdminServer();
   await teardownChannelAdapters();
   process.exit(0);
 }
