@@ -71,6 +71,10 @@ const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
+// Cap on participant IDs included in an inbound metadata payload. Beyond
+// this we send count + a "truncated" flag so the prompt doesn't bloat for
+// 500+ member groups.
+const PARTICIPANTS_INBOUND_CAP = 50;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
 
@@ -130,10 +134,71 @@ function formatWhatsApp(text: string): string {
   return segments.map(({ content, isProtected }) => (isProtected ? content : transformForWhatsApp(content))).join('');
 }
 
+/**
+ * Parse @<digits> mentions out of an outbound text. Returns the JIDs that
+ * Baileys needs in the `mentions` array so WhatsApp renders them as tags
+ * and notifies the receivers. Text is left as-is — WhatsApp's UI uses the
+ * literal `@<digits>` in the body to know where to highlight.
+ *
+ * Phone JID range: 8-15 digits covers all valid country codes. Excludes
+ * email addresses (no `@` after digit-letter mix) and accidental matches
+ * like prices `@5`.
+ *
+ * `@all` / `@todos` (case-insensitive, word-boundary) is a separate path
+ * handled in `expandAllMentions` because it requires the caller to know
+ * the group's full participant list. We strip it from the result here so
+ * callers can tell whether the broadcast token was present.
+ */
+export function parseMentions(text: string): {
+  mentions: string[];
+  hasAll: boolean;
+} {
+  // `(?!\d)` anchor prevents partial matches inside longer digit runs —
+  // `@1234567890123456` (16 digits) shouldn't pick up the first 15 as a
+  // bogus JID. Anything that's not a digit (space, comma, end-of-string,
+  // letters) is a valid trailing context.
+  const matches = text.matchAll(/@(\d{8,15})(?!\d)/g);
+  const mentions = [...new Set([...matches].map((m) => `${m[1]}@s.whatsapp.net`))];
+  // Unicode-safe boundary: `\b` in JS regex treats `á`/`ñ`/etc. as
+  // non-word, which would make `@allá` and `@todosá` match. Negative
+  // lookahead with `\p{L}\p{N}` (Unicode letter / number) properly
+  // excludes any letter from any script.
+  const hasAll = /@(?:all|todos)(?![\p{L}\p{N}_])/iu.test(text);
+  return { mentions, hasAll };
+}
+
+/**
+ * Resolve `@all` to the list of every participant JID in a group. Caller
+ * passes in the cached participant list (or null when the cache is empty
+ * / the group can't be looked up). When `hasAll` is true but participants
+ * is null, we just notify the digit-mentions that were already parsed —
+ * better than blocking the message on a metadata fetch.
+ */
+export function expandAllMentions(args: {
+  parsed: { mentions: string[]; hasAll: boolean };
+  participants: string[] | null;
+}): string[] {
+  const { parsed, participants } = args;
+  if (!parsed.hasAll || !participants || participants.length === 0) {
+    return parsed.mentions;
+  }
+  return [...new Set([...parsed.mentions, ...participants])];
+}
+
 /** Map file extension to Baileys media message type. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?: string): any {
-  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+  // .webp gets sent as a native sticker, not as an image attachment. WhatsApp
+  // renders sticker messages with no border, in-line, and supports animated
+  // sticker frames. The agent generates .webp specifically for this rendering;
+  // sending as image with `mimetype: 'image/webp'` shows it as a generic image
+  // with a download button, which defeats the purpose. Stickers don't carry
+  // captions — if caption was passed it'll be sent separately by the caller.
+  if (ext === '.webp') {
+    return { sticker: data };
+  }
+
+  const imageExts = ['.jpg', '.jpeg', '.png', '.gif'];
   const videoExts = ['.mp4', '.mov', '.avi', '.mkv'];
   const audioExts = ['.mp3', '.ogg', '.m4a', '.wav', '.aac', '.opus'];
 
@@ -270,6 +335,26 @@ registerChannelAdapter('whatsapp', {
       return metadata;
     }
 
+    /**
+     * Return the list of participant JIDs for a group, or null if it's not a
+     * group / we can't fetch metadata. Reuses `getNormalizedGroupMetadata`'s
+     * cache (TTL-based) so we don't burn an API call on every inbound. JIDs
+     * are returned raw — `@s.whatsapp.net` for phone, `@lid` for hidden IDs;
+     * caller decides what to do (the inbound metadata path keeps both, the
+     * `@all` outbound expansion uses the raw JIDs which is what Baileys'
+     * `mentions` field expects).
+     */
+    async function getParticipantsList(jid: string): Promise<string[] | null> {
+      try {
+        const metadata = await getNormalizedGroupMetadata(jid);
+        if (!metadata) return null;
+        return metadata.participants.map((p) => p.id);
+      } catch (err) {
+        log.warn('Failed to load group participants', { jid, err });
+        return null;
+      }
+    }
+
     async function syncGroupMetadata(force = false): Promise<void> {
       if (!force && lastGroupSync && Date.now() - lastGroupSync < GROUP_SYNC_INTERVAL_MS) {
         return;
@@ -393,14 +478,107 @@ registerChannelAdapter('whatsapp', {
       return results;
     }
 
-    async function sendRawMessage(jid: string, text: string): Promise<string | undefined> {
+    /**
+     * When the user replies citing a previous message (Baileys puts it under
+     * `extendedTextMessage.contextInfo.quotedMessage`), build a synthetic
+     * WAMessage envelope so `downloadMediaMessage` can fetch the cited file
+     * and append it to the inbound attachments. Returns null when there is
+     * no quoted media or no quote at all.
+     *
+     * The synthetic envelope must use the original quoted message's stanzaId
+     * + participant from `contextInfo` — Baileys uses these to reconstruct
+     * the encrypted media keys. Without them the download throws.
+     */
+    async function processQuotedMessage(
+      msg: WAMessage,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      normalized: any,
+    ): Promise<{
+      prefix: string;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      quotedAttachments: Array<{ type: string; name: string; localPath: string }>;
+    } | null> {
+      const ctx = normalized.extendedTextMessage?.contextInfo;
+      const quoted = ctx?.quotedMessage;
+      if (!quoted) return null;
+
+      const quotedText =
+        quoted.conversation ||
+        quoted.extendedTextMessage?.text ||
+        quoted.imageMessage?.caption ||
+        quoted.videoMessage?.caption ||
+        quoted.documentMessage?.fileName ||
+        (quoted.audioMessage ? '<voice note>' : '') ||
+        (quoted.stickerMessage ? '<sticker>' : '') ||
+        '<media>';
+
+      const prefix = `[Replying to: "${quotedText.slice(0, 200)}"]`;
+
+      // Try to re-download the cited media. If contextInfo lacks the
+      // identifying fields, downloadMediaMessage will fail; we swallow that
+      // and just return the text prefix so the agent at least sees the cite.
+      let quotedAttachments: Array<{ type: string; name: string; localPath: string }> = [];
+      const hasMedia =
+        quoted.imageMessage ||
+        quoted.videoMessage ||
+        quoted.audioMessage ||
+        quoted.documentMessage;
+      if (hasMedia && ctx.stanzaId) {
+        const syntheticMsg: WAMessage = {
+          key: {
+            remoteJid: msg.key.remoteJid,
+            id: ctx.stanzaId,
+            fromMe: false,
+            participant: ctx.participant,
+          },
+          message: quoted,
+        };
+        try {
+          quotedAttachments = await downloadInboundMedia(syntheticMsg, quoted);
+        } catch (err) {
+          log.warn('Failed to download quoted media', { err });
+        }
+      }
+
+      return { prefix, quotedAttachments };
+    }
+
+    /**
+     * Compute the `mentions` array for an outbound text. Lazy-fetches
+     * group participants only when `@all`/`@todos` is present (the common
+     * `@<digits>` case doesn't need a metadata round-trip). For DMs we skip
+     * even the `@all` expansion — there's no one else to broadcast to.
+     */
+    async function resolveMentionsForText(
+      platformId: string,
+      text: string,
+    ): Promise<string[]> {
+      const parsed = parseMentions(text);
+      if (!parsed.hasAll || !platformId.endsWith('@g.us')) {
+        return parsed.mentions;
+      }
+      const participants = await getParticipantsList(platformId);
+      return expandAllMentions({ parsed, participants });
+    }
+
+    async function sendRawMessage(
+      jid: string,
+      text: string,
+      mentions?: string[],
+    ): Promise<string | undefined> {
       if (!connected) {
+        // Mentions are dropped on requeue — the queue is a string-text fallback
+        // for offline catch-up. Re-enqueueing as plain text loses the tag but
+        // delivers the content; better than failing the send.
         outgoingQueue.push({ jid, text });
         log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
         return;
       }
       try {
-        const sent = await sock.sendMessage(jid, { text });
+        const payload = mentions && mentions.length > 0
+          ? { text, mentions }
+          : { text };
+        const sent = await sock.sendMessage(jid, payload);
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
           if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
@@ -549,6 +727,21 @@ registerChannelAdapter('whatsapp', {
 
       sock.ev.on('creds.update', saveCreds);
 
+      // Invalidate cached group metadata when participants change (add/remove/
+      // promote/demote). The next call to getNormalizedGroupMetadata will
+      // refetch — cheaper than eagerly refreshing here, and avoids racing
+      // with Baileys' own state propagation.
+      sock.ev.on('group-participants.update', (update) => {
+        try {
+          if (update?.id) {
+            groupMetadataCache.delete(update.id);
+            log.debug('Invalidated group metadata cache', { jid: update.id, action: update.action });
+          }
+        } catch (err) {
+          log.warn('Failed to handle group-participants.update', { err });
+        }
+      });
+
       // Baileys 7.x: built-in LIDMappingStore auto-tracks lid↔pn mappings.
       // Translation happens on-demand via signalRepository.lidMapping.getPNForLID
       // (see translateJid). No proactive event listener needed — this matches
@@ -559,6 +752,17 @@ registerChannelAdapter('whatsapp', {
         for (const msg of messages) {
           try {
             if (!msg.message) continue;
+
+            // Loop-break #1 (universal): if this key.id is in our send cache,
+            // it's our own outbound coming back via WhatsApp's linked-device
+            // echo. Covers text, files, stickers, reactions — anything that
+            // went through sock.sendMessage. Beats the text-prefix check in
+            // piggyback mode for archive-only outbounds (.pptx/.ogg/etc.)
+            // where content === '' and the prefix detector misses.
+            if (msg.key.id && sentMessageCache.has(msg.key.id)) {
+              continue;
+            }
+
             // Cache the original WAMessageKey so reactToMessage can recover
             // `participant` (required for reactions in groups).
             if (msg.key.id) {
@@ -605,12 +809,37 @@ registerChannelAdapter('whatsapp', {
             // Download media attachments (images, video, audio, documents)
             const attachments = await downloadInboundMedia(msg, normalized);
 
+            // Quoted/replied-to message: extract its text + re-download any
+            // cited media so the agent can act on attachments the user is
+            // pointing to (e.g. "ves este zip?" while citing a previous .zip).
+            const quoted = await processQuotedMessage(msg, normalized);
+            if (quoted) {
+              attachments.push(...quoted.quotedAttachments);
+              const quotedAudio = quoted.quotedAttachments.find((a) => a.type === 'audio');
+              if (quotedAudio) {
+                const audioPath = path.join(DATA_DIR, quotedAudio.localPath);
+                const transcript = await transcribeAudioOptional(audioPath);
+                if (transcript) {
+                  content = content
+                    ? `${quoted.prefix}\n[Voice in reply target: ${transcript}]\n${content}`
+                    : `${quoted.prefix}\n[Voice in reply target: ${transcript}]`;
+                  log.info('WhatsApp: quoted voice transcribed', { length: transcript.length });
+                } else {
+                  content = content ? `${quoted.prefix}\n${content}` : quoted.prefix;
+                }
+              } else {
+                content = content ? `${quoted.prefix}\n${content}` : quoted.prefix;
+              }
+            }
+
             // Voice notes — transcribe (if WHISPER_BIN or OPENAI_API_KEY set)
             // and prefix the result to content so the agent reads the words
             // directly. Without transcription the agent only sees the file
             // path and would have to call a tool to listen to it. Same shape
             // as Signal v2 (PR #1962): "[Voice: <transcript>]".
-            const audioAttachment = attachments.find((a) => a.type === 'audio');
+            const audioAttachment = attachments.find(
+              (a) => a.type === 'audio' && !quoted?.quotedAttachments.includes(a),
+            );
             if (audioAttachment) {
               const audioPath = path.join(DATA_DIR, audioAttachment.localPath);
               const transcript = await transcribeAudioOptional(audioPath);
@@ -660,6 +889,27 @@ registerChannelAdapter('whatsapp', {
               }
             }
 
+            // For group messages, attach the participant roster so the agent
+            // knows who is in the chat without having to ask. Capped at
+            // PARTICIPANTS_INBOUND_CAP to keep prompt size bounded — for
+            // larger groups we send count + admin-only list. Names aren't
+            // included (Baileys' groupMetadata returns only IDs); the agent
+            // gets phone numbers it can mention with `@<digits>`.
+            let groupParticipants:
+              | { ids: string[]; total: number; truncated: boolean }
+              | undefined;
+            if (isGroup) {
+              const all = await getParticipantsList(chatJid);
+              if (all) {
+                const truncated = all.length > PARTICIPANTS_INBOUND_CAP;
+                groupParticipants = {
+                  ids: truncated ? all.slice(0, PARTICIPANTS_INBOUND_CAP) : all,
+                  total: all.length,
+                  truncated,
+                };
+              }
+            }
+
             const inbound: InboundMessage = {
               id: msg.key.id || `wa-${Date.now()}`,
               kind: 'chat',
@@ -668,6 +918,7 @@ registerChannelAdapter('whatsapp', {
                 sender,
                 senderName,
                 ...(attachments.length > 0 && { attachments }),
+                ...(groupParticipants && { participants: groupParticipants }),
                 fromMe,
                 isBotMessage,
                 isGroup,
@@ -848,15 +1099,32 @@ registerChannelAdapter('whatsapp', {
 
         if (!text && !hasFiles) return;
 
-        // Send file attachments (first file gets the caption, rest are captionless)
+        // Resolve mentions once — we may apply them either to a caption or
+        // to the standalone-text fallback below. Computed before the file
+        // loop so an async metadata fetch (for `@all` expansion in groups)
+        // doesn't block per-file sends.
+        const captionMentions = text
+          ? await resolveMentionsForText(platformId, text)
+          : [];
+
+        // Send file attachments. Caption goes on the first file that
+        // supports captions (stickers don't — `.webp` is a native sticker,
+        // it doesn't render text alongside, so we'd lose the caption if we
+        // tried). If no file accepts the caption, the text falls through to
+        // the plain-text path below.
         if (hasFiles) {
           let captionUsed = false;
           for (const file of message.files!) {
             try {
               const ext = path.extname(file.filename).toLowerCase();
-              const caption = !captionUsed ? text : undefined;
+              const supportsCaption = ext !== '.webp';
+              const caption = !captionUsed && supportsCaption ? text : undefined;
               const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
-              const sent = await sock.sendMessage(platformId, mediaMsg);
+              const payload =
+                caption && captionMentions.length > 0
+                  ? { ...mediaMsg, mentions: captionMentions }
+                  : mediaMsg;
+              const sent = await sock.sendMessage(platformId, payload);
               if (sent?.key?.id && sent.message) {
                 sentMessageCache.set(sent.key.id, sent.message);
               }
@@ -871,7 +1139,12 @@ registerChannelAdapter('whatsapp', {
         if (text) {
           const formatted = formatWhatsApp(text);
           const prefixed = ASSISTANT_HAS_OWN_NUMBER ? formatted : `${ASSISTANT_NAME}: ${formatted}`;
-          return sendRawMessage(platformId, prefixed);
+          // Re-parse mentions on the prefixed text so the `Ghosty: ` prefix
+          // doesn't shift digit indexes — Baileys keys the highlight off
+          // the literal `@<digits>` substring, not byte offsets, so this is
+          // mostly cosmetic but keeps parser & payload consistent.
+          const finalMentions = await resolveMentionsForText(platformId, prefixed);
+          return sendRawMessage(platformId, prefixed, finalMentions);
         }
       },
 
