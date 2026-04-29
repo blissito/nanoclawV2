@@ -176,6 +176,7 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const attachmentsSuffix = formatAttachments(content.attachments);
+  const participantsSuffix = formatParticipants(content.participants);
 
   // Look up the destination name for the origin (reverse map lookup).
   // If not found, fall back to a raw channel:platform_id marker so nothing
@@ -188,7 +189,7 @@ function formatSingleChat(msg: MessageInRow): string {
       ? ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"`
       : '';
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}${participantsSuffix}</message>`;
 }
 
 function formatTaskMessage(msg: MessageInRow): string {
@@ -229,6 +230,25 @@ function formatReplyContext(replyTo: any): string {
   const text = replyTo.text;
   if (!sender || !text) return '';
   return `\n  <quoted_message from="${escapeXml(sender)}">${escapeXml(text)}</quoted_message>\n`;
+}
+
+/**
+ * Render the group participant roster the WhatsApp adapter attaches to
+ * inbound messages from groups. Surfaces phone JIDs and `@lid` IDs so the
+ * agent can mention them with `@<digits>` (the adapter parses that on
+ * outbound). When `truncated` is true, the agent only sees the first N
+ * (PARTICIPANTS_INBOUND_CAP) — total is included so it knows the cap was
+ * applied.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatParticipants(participants: any): string {
+  if (!participants || !Array.isArray(participants.ids) || participants.ids.length === 0) {
+    return '';
+  }
+  const total = typeof participants.total === 'number' ? participants.total : participants.ids.length;
+  const truncated = participants.truncated ? ' truncated="true"' : '';
+  const ids = participants.ids.map((id: string) => escapeXml(id)).join(', ');
+  return `\n  <participants total="${total}"${truncated}>${ids}</participants>`;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

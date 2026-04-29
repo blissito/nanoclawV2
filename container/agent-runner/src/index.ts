@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     },
     easybits: {
       command: 'npx',
-      args: ['-y', '@easybits.cloud/mcp'],
+      args: ['-y', '@easybits.cloud/mcp', '--tools', process.env.EASYBITS_TOOLSETS || 'core,design'],
       env: { EASYBITS_API_KEY: process.env.EASYBITS_API_KEY || '' },
     },
     brightdata: {

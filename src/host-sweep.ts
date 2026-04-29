@@ -54,13 +54,20 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Stalled-progress detection: container is alive and heartbeating but Claude
+// SDK has produced no outbound message in this long despite holding a claim.
+// The poll-loop emits the heartbeat — a colgged Claude child won't break it,
+// so this rule keys off outbound timestamps instead. Long enough that a real
+// long-running Bash (e.g. ImageMagick batch) doesn't trip it.
+export const STALLED_PROGRESS_MS = 5 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
-  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
+  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number }
+  | { action: 'kill-stalled'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
  * Pure decision for whether a running container should be killed this sweep
@@ -72,8 +79,13 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  // When undefined, the stalled-progress rule is skipped. Pass 0 to mean
+  // "no outbound ever written" (which DOES trip the stalled rule for old
+  // claims). Existing callers that don't pass it preserve original
+  // ceiling+claim semantics.
+  lastOutboundMs?: number;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, lastOutboundMs } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -100,6 +112,32 @@ export function decideStuckAction(args: {
     if (claimAge <= tolerance) continue;
     if (heartbeatMtimeMs > claimedAt) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
+  }
+
+  // Stalled-progress: heartbeat is fresh (poll-loop alive) and we haven't
+  // tripped 'kill-claim' because the heartbeat keeps moving past claimedAt,
+  // but Claude itself has produced no outbound since the claim. The original
+  // heartbeat-vs-claim rule misses this because the heartbeat is written by
+  // the poll-loop, which keeps running even when the SDK child is colgged.
+  // This rule keys off outbound progress to catch that case. Tolerance is
+  // longer (5 min default, expanded by declaredBashMs) so genuine long
+  // tool-calls don't false-positive.
+  if (lastOutboundMs !== undefined) {
+    const stalledTolerance = Math.max(STALLED_PROGRESS_MS, declaredBashMs ?? 0);
+    for (const claim of claims) {
+      const claimedAt = Date.parse(claim.status_changed);
+      if (Number.isNaN(claimedAt)) continue;
+      const claimAge = now - claimedAt;
+      if (claimAge <= stalledTolerance) continue;
+      // Outbound row newer than the claim → the agent IS making progress.
+      if (lastOutboundMs > claimedAt) continue;
+      return {
+        action: 'kill-stalled',
+        messageId: claim.message_id,
+        claimAgeMs: claimAge,
+        toleranceMs: stalledTolerance,
+      };
+    }
   }
 
   return { action: 'ok' };
@@ -222,6 +260,7 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    lastOutboundMs: lastOutboundTimestampMs(outDb),
   });
 
   if (decision.action === 'ok') return;
@@ -237,6 +276,23 @@ function enforceRunningContainerSla(
     return;
   }
 
+  if (decision.action === 'kill-stalled') {
+    // Claude SDK session is corrupted (open tool_use without tool_result).
+    // Resuming the same session_id replays the bug, so clear it so the next
+    // spawn starts a fresh SDK session. Conversation context lives in
+    // /workspace and the per-day archive — not lost.
+    log.warn('Killing container — outbound stalled past tolerance', {
+      sessionId: session.id,
+      messageId: decision.messageId,
+      claimAgeMs: decision.claimAgeMs,
+      toleranceMs: decision.toleranceMs,
+    });
+    killContainer(session.id, 'stalled-progress');
+    clearSdkSessionId(outDb);
+    resetStuckProcessingRows(inDb, outDb, session, 'stalled-progress');
+    return;
+  }
+
   log.warn('Killing container — message claimed then silent', {
     sessionId: session.id,
     messageId: decision.messageId,
@@ -245,6 +301,27 @@ function enforceRunningContainerSla(
   });
   killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+}
+
+function lastOutboundTimestampMs(outDb: Database.Database): number {
+  try {
+    const row = outDb
+      .prepare('SELECT MAX(timestamp) AS t FROM messages_out')
+      .get() as { t: string | null } | undefined;
+    if (!row?.t) return 0;
+    const ms = Date.parse(row.t);
+    return Number.isNaN(ms) ? 0 : ms;
+  } catch {
+    return 0;
+  }
+}
+
+function clearSdkSessionId(outDb: Database.Database): void {
+  try {
+    outDb.prepare("DELETE FROM session_state WHERE key = 'sdk_session_id'").run();
+  } catch (err) {
+    log.warn('Failed to clear sdk_session_id', { err });
+  }
 }
 
 function resetStuckProcessingRows(
