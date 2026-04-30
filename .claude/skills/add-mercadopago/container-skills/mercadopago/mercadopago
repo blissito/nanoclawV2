@@ -1,0 +1,57 @@
+#!/bin/bash
+# MercadoPago payment link creator
+# Usage: mercadopago create-link <amount> "<description>"
+#
+# Auth is handled by OneCLI — the HTTPS_PROXY rewrites the Authorization
+# header at api.mercadopago.com. Always pass `Bearer placeholder`.
+
+set -euo pipefail
+
+command="${1:-}"
+shift || true
+
+case "$command" in
+  create-link)
+    amount="${1:-}"
+    description="${2:-Pago}"
+
+    if [ -z "$amount" ]; then
+      echo "Error: amount is required. Usage: mercadopago create-link <amount> \"<description>\""
+      exit 1
+    fi
+
+    response=$(curl -s -X POST "https://api.mercadopago.com/checkout/preferences" \
+      -H "Authorization: Bearer placeholder" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"items\": [{
+          \"title\": \"$description\",
+          \"quantity\": 1,
+          \"unit_price\": $amount,
+          \"currency_id\": \"MXN\"
+        }],
+        \"expires\": true,
+        \"expiration_date_to\": \"$(date -u -d '+24 hours' '+%Y-%m-%dT%H:%M:%S.000+00:00' 2>/dev/null || date -u -v+24H '+%Y-%m-%dT%H:%M:%S.000+00:00')\"
+      }")
+
+    url=$(echo "$response" | grep -o '"init_point":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [ -n "$url" ]; then
+      echo "Payment link created successfully!"
+      echo "URL: $url"
+      echo "Amount: \$${amount} MXN"
+      echo "Description: $description"
+    else
+      echo "Error creating payment link:"
+      echo "$response"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: mercadopago create-link <amount> \"<description>\""
+    echo ""
+    echo "Commands:"
+    echo "  create-link  Create a MercadoPago checkout link"
+    exit 1
+    ;;
+esac

@@ -229,11 +229,22 @@ Show:
 - Breaking changes applied (list skills run, if any)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
 
+Patch existing systemd unit if it predates `EnvironmentFile=-` (only applies on Linux installs that ran `/setup` before April 2026):
+1. Detect the unit file: `ls /etc/systemd/system/nanoclaw-v2-*.service ~/.config/systemd/user/nanoclaw-v2-*.service 2>/dev/null`. Use the one that exists.
+2. Check it for the line: `grep -q "^EnvironmentFile=" <unit-path>`. If absent AND the install has a `.env` file at `<projectRoot>/.env`, add the line:
+   ```
+   sudo sed -i "/^Environment=PATH/a EnvironmentFile=-<projectRoot>/.env" <unit-path>
+   sudo systemctl daemon-reload
+   ```
+   Without this, the host process can't read `NANOCLAW_ADMIN_TOKEN` and admin-server / usage-reporter run silent. Skip on macOS/launchd (plist uses inline `EnvironmentVariables` block; not affected).
+3. Tell the user the line was added (if it was) so they can verify.
+
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
 - Restart the service to apply changes:
   - If using launchd: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist && launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist`
+  - If using systemd: `sudo systemctl restart nanoclaw-v2-*.service`
   - If running manually: restart `pnpm run dev`
 
 

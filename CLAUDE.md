@@ -229,6 +229,8 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 - **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
 - **Changing the Dockerfile entrypoint or the dynamic-spawn command** (`src/container-runner.ts` line ~301) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
 - **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
+- **Editing `container/CLAUDE.md` or `groups/<folder>/CLAUDE.md`** → the composed CLAUDE.md is mounted RO at spawn; running containers keep the old version until they die. Either wait for the idle sweep (~60s) or `docker stop` the running agent container so the next message wake re-runs `composeClaudeMd`. No service restart needed.
+- **Deleting an agent group's custom image (`docker rmi nanoclaw-agent-v2-*:ag-*`)** → next spawn fails with `Container exited code=125` because the host reads `imageTag` from `groups/<folder>/container.json` and finds it gone. The host does NOT auto-rebuild. Either repoint `imageTag` to `nanoclaw-agent-v2-<install>:latest` (and clear `packages.apt` if those deps are now in the base image), or rebuild the custom layer manually. Same applies after editing the base Dockerfile in a way that should propagate to per-group images — `rmi` the per-group tag *and* update its `container.json`.
 
 ## CJK font support
 
