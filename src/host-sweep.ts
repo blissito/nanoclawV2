@@ -26,7 +26,7 @@
  *        → kill + reset this message + tries++. Semantics: "container
  *        claimed a message and went quiet past tolerance since the claim."
  */
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 
 import { getActiveSessions } from './db/sessions.js';
@@ -42,7 +42,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
+import { openInboundDb, openOutboundDb, inboundDbPath, outboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
@@ -205,6 +205,17 @@ async function sweepSession(session: Session): Promise<void> {
       syncProcessingAcks(inDb, outDb);
     }
 
+    // 1b. Pre-wake cleanup: if the container is dead at the top of this tick,
+    // run the crashed-container cleanup BEFORE deciding to wake. This handles
+    // the respawn-storm case where a container crashes in startup (before
+    // clearStaleProcessingAcks() ever runs), because in that path the post-
+    // wake "if (!alive)" branch never fires — wake makes alive=true even
+    // though the container immediately dies. Without this, tries never
+    // increments and the same poisoned message respawns forever every tick.
+    if (outDb && !isContainerRunning(session.id)) {
+      resetStuckProcessingRows(inDb, outDb, session, agentGroup.id, 'pre-wake');
+    }
+
     // 2. Wake a container if work is due and nothing is running. Ordered
     // before the crashed-container cleanup so a fresh container gets a chance
     // to clean its own orphan processing_ack rows on startup (see
@@ -230,7 +241,7 @@ async function sweepSession(session: Session): Promise<void> {
     // or wake failed). resetStuckProcessingRows itself is idempotent — it
     // skips messages already scheduled for a future retry.
     if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+      resetStuckProcessingRows(inDb, outDb, session, agentGroup.id, 'container not running');
     }
 
     // 5. Recurrence fanout for completed recurring tasks.
@@ -287,7 +298,7 @@ function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    resetStuckProcessingRows(inDb, outDb, session, agentGroupId, 'absolute-ceiling');
     return;
   }
 
@@ -304,7 +315,7 @@ function enforceRunningContainerSla(
     });
     killContainer(session.id, 'stalled-progress');
     clearSdkSessionId(outDb);
-    resetStuckProcessingRows(inDb, outDb, session, 'stalled-progress');
+    resetStuckProcessingRows(inDb, outDb, session, agentGroupId, 'stalled-progress');
     return;
   }
 
@@ -315,7 +326,7 @@ function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  resetStuckProcessingRows(inDb, outDb, session, agentGroupId, 'claim-stuck');
 }
 
 function lastOutboundTimestampMs(outDb: Database.Database): number {
@@ -343,36 +354,67 @@ function resetStuckProcessingRows(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
+  agentGroupId: string,
   reason: string,
 ): void {
   const claims = getProcessingClaims(outDb);
+  if (claims.length === 0) return;
+
+  // Open a short-lived writable handle to outbound.db so we can clean orphan
+  // processing_ack rows. The shared `outDb` is opened readonly to preserve
+  // the single-writer invariant during normal operation, but this function
+  // is only called when the container is dead (post-killContainer or in the
+  // !alive path) — so there is no concurrent writer to race with. Without
+  // this cleanup, a claim whose container crashed before
+  // clearStaleProcessingAcks() could run becomes immortal: claim_age grows
+  // forever and the SLA loops on it every tick (seen in prod as a 3.6h
+  // respawn-storm on session sess-1777082917028-5vohcj).
+  const outWriter = new Database(outboundDbPath(agentGroupId, session.id));
   const now = Date.now();
-  for (const { message_id } of claims) {
-    const msg = getMessageForRetry(inDb, message_id, 'pending');
-    if (!msg) continue;
+  try {
+    const clearClaim = outWriter.prepare('DELETE FROM processing_ack WHERE message_id = ?');
 
-    // Already rescheduled for a future retry — don't bump tries again. The
-    // wake path (sweep step 2) will fire when process_after elapses and a
-    // fresh container will clean the orphan claim on startup.
-    if (msg.processAfter && Date.parse(msg.processAfter) > now) continue;
+    for (const { message_id } of claims) {
+      const msg = getMessageForRetry(inDb, message_id, 'pending');
+      if (!msg) {
+        // Orphan: inbound row is missing or no longer pending. The claim has
+        // no owner; clean it so the SLA stops tripping on it.
+        clearClaim.run(message_id);
+        log.info('Cleared orphan processing_ack', { messageId: message_id, sessionId: session.id, reason });
+        continue;
+      }
 
-    if (msg.tries >= MAX_TRIES) {
-      markMessageFailed(inDb, msg.id);
-      log.warn('Message marked as failed after max retries', {
-        messageId: msg.id,
-        sessionId: session.id,
-        reason,
-      });
-    } else {
-      const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
-      const backoffSec = Math.floor(backoffMs / 1000);
-      retryWithBackoff(inDb, msg.id, backoffSec);
-      log.info('Reset stale message with backoff', {
-        messageId: msg.id,
-        tries: msg.tries,
-        backoffMs,
-        reason,
-      });
+      // Already rescheduled for a future retry — don't bump tries again.
+      // Drop the claim now (container is dead) so the next wake's fresh
+      // container doesn't have to rely on its own clearStaleProcessingAcks()
+      // running before the host SLA judges it.
+      if (msg.processAfter && Date.parse(msg.processAfter) > now) {
+        clearClaim.run(message_id);
+        continue;
+      }
+
+      if (msg.tries >= MAX_TRIES) {
+        markMessageFailed(inDb, msg.id);
+        clearClaim.run(msg.id);
+        log.warn('Message marked as failed after max retries', {
+          messageId: msg.id,
+          sessionId: session.id,
+          reason,
+        });
+      } else {
+        const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
+        const backoffSec = Math.floor(backoffMs / 1000);
+        retryWithBackoff(inDb, msg.id, backoffSec);
+        clearClaim.run(msg.id);
+        log.info('Reset stale message with backoff', {
+          messageId: msg.id,
+          tries: msg.tries,
+          backoffMs,
+          reason,
+        });
+      }
     }
+  } finally {
+    outWriter.close();
   }
 }
