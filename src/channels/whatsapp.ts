@@ -38,6 +38,7 @@ import {
 import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR } from '../config.js';
+import { getDb } from '../db/connection.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -184,6 +185,40 @@ export function expandAllMentions(args: {
     return parsed.mentions;
   }
   return [...new Set([...parsed.mentions, ...participants])];
+}
+
+/**
+ * Parse `@<word>` name-style mentions out of an outbound text — the LLM
+ * writes "@Bliss" but Baileys only renders mentions when literal `@<digits>`
+ * appears in the body. We extract candidate names so the resolver can look
+ * them up in the v2 users table and rewrite to phone numbers.
+ *
+ * Filters out: `@<digits>` (handled by parseMentions), `@all`/`@todos`
+ * (handled by expandAllMentions). Letter-leading + 2+30 chars covers
+ * typical first names without dragging in noise like "@5" or "@hi".
+ */
+export function parseNameMentions(text: string): string[] {
+  const matches = [...text.matchAll(/@([\p{L}][\p{L}\p{N}_-]{1,30})/giu)];
+  const candidates = matches
+    .map((m) => m[1])
+    .filter((n) => !/^(all|todos)$/i.test(n))
+    .filter((n) => !/^\d+$/.test(n));
+  return [...new Set(candidates)];
+}
+
+/**
+ * Look up users in the central DB by display_name (case-insensitive
+ * substring match). Returns user.id (channel-prefixed JID, e.g.
+ * `whatsapp:5217712412825@s.whatsapp.net`) and display_name. Caller
+ * is responsible for stripping the prefix and intersecting with the
+ * group's participant list before sending mentions.
+ */
+function findUsersByName(names: string[]): Array<{ id: string; display_name: string | null }> {
+  if (names.length === 0) return [];
+  const placeholders = names.map(() => 'LOWER(display_name) LIKE ?').join(' OR ');
+  return getDb()
+    .prepare(`SELECT id, display_name FROM users WHERE display_name IS NOT NULL AND (${placeholders})`)
+    .all(...names.map((n) => `%${n.toLowerCase()}%`)) as Array<{ id: string; display_name: string | null }>;
 }
 
 /** Map file extension to Baileys media message type. */
@@ -562,6 +597,57 @@ registerChannelAdapter('whatsapp', {
       return expandAllMentions({ parsed, participants });
     }
 
+    /**
+     * Resolve `@Name` (text-name) mentions and rewrite them to `@<phone>`
+     * so Baileys actually highlights the tag and notifies the receiver.
+     * Combines with the existing digit + `@all`/`@todos` resolution.
+     *
+     * Returns `{text, mentions}` because Baileys only renders a mention
+     * when the literal `@<digits>` substring appears in the body matching
+     * a JID in the mentions array — we cannot just add JIDs without
+     * rewriting the visible text. Lookup keys off the central `users`
+     * table (display_name) and intersects with the group's current
+     * participant list so we never @-tag someone who isn't in this chat.
+     */
+    async function resolveMentionsAndRewrite(
+      platformId: string,
+      text: string,
+    ): Promise<{ text: string; mentions: string[] }> {
+      const baseMentions = await resolveMentionsForText(platformId, text);
+      if (!platformId.endsWith('@g.us')) return { text, mentions: baseMentions };
+
+      const candidateNames = parseNameMentions(text);
+      if (candidateNames.length === 0) return { text, mentions: baseMentions };
+
+      const users = findUsersByName(candidateNames);
+      if (users.length === 0) return { text, mentions: baseMentions };
+
+      const participants = await getParticipantsList(platformId);
+      if (!participants || participants.length === 0) return { text, mentions: baseMentions };
+      const participantSet = new Set(participants);
+
+      const stripPrefix = (id: string): string => (id.startsWith('whatsapp:') ? id.slice('whatsapp:'.length) : id);
+
+      let outText = text;
+      const finalMentions = new Set(baseMentions);
+      for (const name of candidateNames) {
+        const lname = name.toLowerCase();
+        const match = users.find((u) => {
+          if (!u.display_name?.toLowerCase().includes(lname)) return false;
+          return participantSet.has(stripPrefix(u.id));
+        });
+        if (!match) continue;
+        const phoneJid = stripPrefix(match.id);
+        const phoneNumber = phoneJid.split('@')[0];
+        // Rewrite ALL occurrences of @Name (case-insensitive, word-bound by
+        // the regex's character class). Use a fresh regex per name so global
+        // state doesn't leak across iterations.
+        outText = outText.replace(new RegExp(`@${name}(?=$|[^\\p{L}\\p{N}_])`, 'giu'), `@${phoneNumber}`);
+        finalMentions.add(phoneJid);
+      }
+      return { text: outText, mentions: [...finalMentions] };
+    }
+
     async function sendRawMessage(
       jid: string,
       text: string,
@@ -930,6 +1016,17 @@ registerChannelAdapter('whatsapp', {
 
             // WhatsApp doesn't use threads — threadId is null
             setupConfig.onInbound(chatJid, null, inbound);
+
+            // Send a read receipt so the user sees the blue ✓✓ — without
+            // this the agent processes the message but the sender keeps
+            // seeing single-✓ "delivered, not read", which feels broken.
+            // Best-effort: WhatsApp sometimes rejects readMessages for
+            // stale envelopes or non-private chats; swallow errors.
+            try {
+              await sock.readMessages([msg.key]);
+            } catch (err) {
+              log.debug('readMessages failed', { jid: chatJid, err });
+            }
           } catch (err) {
             log.error('Error processing incoming WhatsApp message', {
               err,
@@ -1094,19 +1191,50 @@ registerChannelAdapter('whatsapp', {
           return;
         }
 
+        // Native poll. Container emits `content.poll = { name, options, selectableCount? }`
+        // via the send_poll MCP tool; we render as a Baileys poll message.
+        // Polls don't support captions or attachments — handled inline and
+        // returned before the text/file path.
+        if (content.poll && typeof content.poll === 'object') {
+          const poll = content.poll as { name?: string; options?: string[]; selectableCount?: number };
+          if (!poll.name || !Array.isArray(poll.options) || poll.options.length < 2) {
+            log.warn('Invalid poll payload, skipping', { platformId, poll });
+            return;
+          }
+          try {
+            const sent = await sock.sendMessage(platformId, {
+              poll: {
+                name: poll.name,
+                values: poll.options,
+                selectableCount: poll.selectableCount && poll.selectableCount > 0 ? poll.selectableCount : 1,
+              },
+            });
+            if (sent?.key?.id && sent.message) {
+              sentMessageCache.set(sent.key.id, sent.message);
+            }
+            log.info('WhatsApp: poll sent', { platformId, name: poll.name, options: poll.options.length });
+          } catch (err) {
+            log.warn('Failed to send poll', { platformId, err });
+          }
+          return;
+        }
+
         // Normal message (with optional file attachments)
-        const text = (content.markdown as string) || (content.text as string);
+        const rawText = (content.markdown as string) || (content.text as string);
         const hasFiles = message.files && message.files.length > 0;
 
-        if (!text && !hasFiles) return;
+        if (!rawText && !hasFiles) return;
 
-        // Resolve mentions once — we may apply them either to a caption or
-        // to the standalone-text fallback below. Computed before the file
-        // loop so an async metadata fetch (for `@all` expansion in groups)
-        // doesn't block per-file sends.
-        const captionMentions = text
-          ? await resolveMentionsForText(platformId, text)
-          : [];
+        // Resolve + rewrite mentions once. resolveMentionsAndRewrite returns
+        // both the (possibly rewritten) text and the JID array Baileys needs
+        // — we apply both to caption and standalone-text paths so @Name
+        // mentions render consistently. Computed before the file loop so an
+        // async metadata fetch (for @all / @Name resolution) doesn't block
+        // per-file sends.
+        const { text: captionText, mentions: captionMentions } = rawText
+          ? await resolveMentionsAndRewrite(platformId, rawText)
+          : { text: '', mentions: [] as string[] };
+        const text = rawText ? captionText : rawText;
 
         // Send file attachments. Caption goes on the first file that
         // supports captions (stickers don't — `.webp` is a native sticker,
@@ -1140,12 +1268,11 @@ registerChannelAdapter('whatsapp', {
         if (text) {
           const formatted = formatWhatsApp(text);
           const prefixed = ASSISTANT_HAS_OWN_NUMBER ? formatted : `${ASSISTANT_NAME}: ${formatted}`;
-          // Re-parse mentions on the prefixed text so the `Ghosty: ` prefix
-          // doesn't shift digit indexes — Baileys keys the highlight off
-          // the literal `@<digits>` substring, not byte offsets, so this is
-          // mostly cosmetic but keeps parser & payload consistent.
-          const finalMentions = await resolveMentionsForText(platformId, prefixed);
-          return sendRawMessage(platformId, prefixed, finalMentions);
+          // Re-resolve on the prefixed text so any prefix-introduced shifts
+          // are accounted for (cosmetic — Baileys matches by literal substring,
+          // not byte offset — but keeps payload consistent).
+          const { text: finalText, mentions: finalMentions } = await resolveMentionsAndRewrite(platformId, prefixed);
+          return sendRawMessage(platformId, finalText, finalMentions);
         }
       },
 
