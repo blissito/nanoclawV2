@@ -424,6 +424,54 @@ export const shareGroupInviteLink: McpToolDefinition = {
   },
 };
 
+export const sendPoll: McpToolDefinition = {
+  tool: {
+    name: 'send_poll',
+    description:
+      'Send a native WhatsApp poll to the destination. The user sees a native poll UI with selectable options. Use for quick decisions in groups ("¿pizza o tacos?") or surveys. WhatsApp only — other adapters that lack native polls will simply drop the message. Provide `name` (the question), `options` (2-12 strings), and optional `selectableCount` (1 = single-choice, default; >1 = multi-select up to that many).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        to: { type: 'string', description: 'Destination name. Optional if you have only one destination.' },
+        name: { type: 'string', description: 'The poll question' },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of 2-12 answer options',
+        },
+        selectableCount: {
+          type: 'number',
+          description: 'How many options each voter can pick. Default 1 (single-choice).',
+        },
+      },
+      required: ['name', 'options'],
+    },
+  },
+  async handler(args) {
+    const name = args.name as string;
+    const options = args.options as string[];
+    if (!name) return err('name (poll question) is required');
+    if (!Array.isArray(options) || options.length < 2) return err('options must be an array of at least 2 strings');
+    if (options.length > 12) return err('options cannot exceed 12 entries (WhatsApp limit)');
+    const selectableCount = typeof args.selectableCount === 'number' ? args.selectableCount : 1;
+
+    const routing = resolveRouting(args.to as string | undefined);
+    if ('error' in routing) return err(routing.error);
+
+    const id = generateId();
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ poll: { name, options, selectableCount } }),
+    });
+    log(`send_poll: → ${routing.resolvedName} (${options.length} options)`);
+    return ok(`Poll sent to ${routing.resolvedName} (id: ${id})`);
+  },
+};
+
 registerTools([
   sendMessage,
   sendFile,
@@ -432,4 +480,5 @@ registerTools([
   updateGroupSubject,
   updateGroupPhoto,
   shareGroupInviteLink,
+  sendPoll,
 ]);
