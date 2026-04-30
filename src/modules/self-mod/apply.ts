@@ -16,17 +16,29 @@
  *   inbound message. Gated by canAccessAgentGroup for owner / global_admin
  *   / admin_of_group on the TARGET group. Defaults target to caller's own
  *   agent group when content.agent_group_id is null.
+ *
+ * reset_agent: direct delivery action (no approval). Sub-agents only —
+ *   refuses self-reset and refuses targets wired to real channels. Wipes
+ *   CLAUDE.local.md and conversations/ then kills container. Gated by
+ *   owner / global_admin (destructive). Caller passes `name` (destination)
+ *   or `agent_group_id`.
  */
+import fs from 'fs';
+import path from 'path';
+
 import type Database from 'better-sqlite3';
 
+import { GROUPS_DIR } from '../../config.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import type { ApprovalHandler } from '../approvals/index.js';
+import { getDestinationByName, normalizeName } from '../agent-to-agent/db/agent-destinations.js';
 import { canAccessAgentGroup } from '../permissions/access.js';
 
 export const applyInstallPackages: ApprovalHandler = async ({ session, payload, userId, notify }) => {
@@ -135,12 +147,11 @@ export async function applyRestartContainer(
   }
 
   const access = canAccessAgentGroup(userId, targetAgentGroupId);
-  const privileged =
-    access.allowed && ['owner', 'global_admin', 'admin_of_group'].includes(access.reason);
+  const privileged = access.allowed && ['owner', 'global_admin', 'admin_of_group'].includes(access.reason);
   if (!privileged) {
     notifyAgent(
       session,
-      `restart_container rejected: requires owner or admin privileges on agent group "${targetAgentGroupId}". Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'none'}.`,
+      `restart_container rejected: requires owner or admin privileges on agent group "${targetAgentGroupId}". Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'none')}.`,
     );
     return;
   }
@@ -188,6 +199,147 @@ export async function applyRestartContainer(
     reason,
     sessionsKilled: killed,
     self: isSelf,
+  });
+}
+
+/**
+ * Return the channel_types of every messaging_group wired to this agent
+ * group. Used by reset_agent to verify the target is a sub-agent (only
+ * 'agent' channel wirings, or none) and not a real-channel-facing agent.
+ */
+function getWiredChannelTypes(agentGroupId: string): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT mg.channel_type AS channel_type
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+        WHERE mga.agent_group_id = ?`,
+    )
+    .all(agentGroupId) as Array<{ channel_type: string }>;
+  return rows.map((r) => r.channel_type);
+}
+
+export async function applyResetAgent(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
+  const reqName = (content.name as string | null) || null;
+  const reqId = (content.agent_group_id as string | null) || null;
+  const reason = (content.reason as string | undefined) || 'agent-requested reset';
+
+  // Resolve target agent_group_id from name (preferred) or fallback to id.
+  let targetAgentGroupId: string | null = null;
+  if (reqName) {
+    const dest = getDestinationByName(session.agent_group_id, normalizeName(reqName));
+    if (!dest) {
+      notifyAgent(session, `reset_agent rejected: no destination named "${reqName}" in your address book. List your sub-agents to see valid names.`);
+      return;
+    }
+    if (dest.target_type !== 'agent') {
+      notifyAgent(session, `reset_agent rejected: destination "${reqName}" is a channel, not a sub-agent. Reset is only for sub-agents created via create_agent.`);
+      return;
+    }
+    targetAgentGroupId = dest.target_id;
+  } else if (reqId) {
+    targetAgentGroupId = reqId;
+  } else {
+    notifyAgent(session, 'reset_agent rejected: must provide `name` or `agent_group_id`.');
+    return;
+  }
+
+  // Refuse self-reset — reset is for sub-agents only. Use restart_container
+  // for own-container restart.
+  if (targetAgentGroupId === session.agent_group_id) {
+    notifyAgent(session, 'reset_agent rejected: cannot reset your own agent group. Reset is for sub-agents. Use restart_container to restart your own container.');
+    return;
+  }
+
+  const targetGroup = getAgentGroup(targetAgentGroupId);
+  if (!targetGroup) {
+    notifyAgent(session, `reset_agent rejected: agent group "${targetAgentGroupId}" not found.`);
+    return;
+  }
+
+  // Sub-agent check: target must NOT be wired to any real channel. Sub-agents
+  // created via create_agent typically have no messaging_group_agents wirings
+  // at all; if a wiring exists and its channel_type isn't 'agent', the target
+  // is a real-channel-facing agent and reset would surprise users.
+  const wiredChannels = getWiredChannelTypes(targetAgentGroupId);
+  const realChannels = wiredChannels.filter((c) => c !== 'agent');
+  if (realChannels.length > 0) {
+    notifyAgent(
+      session,
+      `reset_agent rejected: agent group "${targetGroup.name}" is wired to real channel(s) (${[...new Set(realChannels)].join(', ')}) and is not a sub-agent. Reset only applies to sub-agents created via create_agent.`,
+    );
+    return;
+  }
+
+  // Permission: stricter than restart_container — owner/global_admin only.
+  // Destructive ops bypass the admin_of_group tier.
+  const userId = getLastInboundUserId(inDb);
+  if (!userId) {
+    notifyAgent(session, 'reset_agent rejected: could not resolve the calling user from the current session.');
+    return;
+  }
+  const access = canAccessAgentGroup(userId, targetAgentGroupId);
+  const privileged = access.allowed && ['owner', 'global_admin'].includes(access.reason);
+  if (!privileged) {
+    notifyAgent(
+      session,
+      `reset_agent rejected: requires owner or global_admin (destructive). Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'none')}.`,
+    );
+    return;
+  }
+
+  // Wipe persisted memory + conversations. Best-effort per file.
+  const folderPath = path.join(GROUPS_DIR, targetGroup.folder);
+  const localMd = path.join(folderPath, 'CLAUDE.local.md');
+  const conversationsDir = path.join(folderPath, 'conversations');
+  let wipedLocal = false;
+  let wipedConversations = false;
+  try {
+    if (fs.existsSync(localMd)) {
+      fs.writeFileSync(localMd, '');
+      wipedLocal = true;
+    }
+  } catch (err) {
+    log.warn('reset_agent: failed to clear CLAUDE.local.md', { folder: targetGroup.folder, err });
+  }
+  try {
+    if (fs.existsSync(conversationsDir)) {
+      fs.rmSync(conversationsDir, { recursive: true, force: true });
+      fs.mkdirSync(conversationsDir, { recursive: true });
+      wipedConversations = true;
+    }
+  } catch (err) {
+    log.warn('reset_agent: failed to wipe conversations/', { folder: targetGroup.folder, err });
+  }
+
+  // Kill all sessions of the target sub-agent so they respawn clean.
+  const sessions = getSessionsByAgentGroup(targetAgentGroupId);
+  let killed = 0;
+  for (const s of sessions) {
+    try {
+      killContainer(s.id, `reset_agent: ${reason}`);
+      killed++;
+    } catch (err) {
+      log.warn('reset_agent: kill failed', { sessionId: s.id, err });
+    }
+  }
+
+  notifyAgent(
+    session,
+    `Sub-agent "${targetGroup.name}" reset (reason: ${reason}). CLAUDE.local.md ${wipedLocal ? 'cleared' : 'absent'}, conversations/ ${wipedConversations ? 'wiped' : 'absent'}, ${killed} container(s) killed. Next message respawns it with fresh state. Report to user.`,
+  );
+  log.info('reset_agent applied', {
+    targetAgentGroupId,
+    folder: targetGroup.folder,
+    requestedBy: userId,
+    reason,
+    sessionsKilled: killed,
+    wipedLocal,
+    wipedConversations,
   });
 }
 

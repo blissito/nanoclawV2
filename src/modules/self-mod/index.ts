@@ -20,12 +20,13 @@
  */
 import { registerDeliveryAction } from '../../delivery.js';
 import { registerApprovalHandler } from '../approvals/index.js';
-import { applyAddMcpServer, applyInstallPackages, applyRestartContainer } from './apply.js';
+import { applyAddMcpServer, applyInstallPackages, applyResetAgent, applyRestartContainer } from './apply.js';
 import { handleAddMcpServer, handleInstallPackages } from './request.js';
 
 registerDeliveryAction('install_packages', handleInstallPackages);
 registerDeliveryAction('add_mcp_server', handleAddMcpServer);
 registerDeliveryAction('restart_container', applyRestartContainer);
+registerDeliveryAction('reset_agent', applyResetAgent);
 
 registerApprovalHandler('install_packages', applyInstallPackages);
 registerApprovalHandler('add_mcp_server', applyAddMcpServer);
