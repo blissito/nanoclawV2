@@ -60,8 +60,16 @@ export const CLAIM_STUCK_MS = 60 * 1000;
 // so this rule keys off outbound timestamps instead. Long enough that a real
 // long-running Bash (e.g. ImageMagick batch) doesn't trip it.
 export const STALLED_PROGRESS_MS = 5 * 60 * 1000;
+// After spawning a fresh container, give it this long to boot + run
+// clearStaleProcessingAcks() before the SLA check is allowed to kill it.
+// Without this, the SLA fires on the same sweep tick as the spawn, sees the
+// previous run's orphan claim, and kills the new container before it can
+// reach the cleanup code — looping forever.
+const SPAWN_GRACE_MS = 30_000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
+
+const lastSpawnAtBySession = new Map<string, number>();
 
 export type StuckDecision =
   | { action: 'ok' }
@@ -207,6 +215,7 @@ async function sweepSession(session: Session): Promise<void> {
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       await wakeContainer(session);
+      lastSpawnAtBySession.set(session.id, Date.now());
     }
 
     const alive = isContainerRunning(session.id);
@@ -255,6 +264,12 @@ function enforceRunningContainerSla(
   session: Session,
   agentGroupId: string,
 ): void {
+  // Grace window after a fresh spawn: the new container needs time to boot
+  // and call clearStaleProcessingAcks() before we judge it "stuck". Skipping
+  // here lets the next sweep tick assess a container that has actually run.
+  const lastSpawn = lastSpawnAtBySession.get(session.id) ?? 0;
+  if (Date.now() - lastSpawn < SPAWN_GRACE_MS) return;
+
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
