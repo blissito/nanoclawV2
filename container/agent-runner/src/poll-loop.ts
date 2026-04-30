@@ -316,6 +316,33 @@ async function processQuery(
   // reporting rather than fabricating an idempotency key.
   let lastReportedSeq = currentMaxOutboundSeq();
 
+  // Periodic in-flight state log so docker logs (dumped on kill) shows what
+  // the agent was doing right before it hung. Cheap — fires every 30s while
+  // the query is alive.
+  const queryStartedAt = Date.now();
+  let lastStateLogAt = 0;
+  const STATE_LOG_INTERVAL_MS = 30_000;
+  function logInflightState(): void {
+    if (Date.now() - lastStateLogAt < STATE_LOG_INTERVAL_MS) return;
+    lastStateLogAt = Date.now();
+    try {
+      const row = getOutboundDb()
+        .prepare(
+          `SELECT current_tool, tool_started_at, tool_declared_timeout_ms FROM container_state WHERE id = 1`,
+        )
+        .get() as { current_tool: string | null; tool_started_at: string | null; tool_declared_timeout_ms: number | null } | undefined;
+      const elapsedS = Math.round((Date.now() - queryStartedAt) / 1000);
+      if (row?.current_tool && row.tool_started_at) {
+        const toolElapsedS = Math.round((Date.now() - Date.parse(row.tool_started_at)) / 1000);
+        log(`[state] turn=${elapsedS}s, in-flight tool=${row.current_tool} for ${toolElapsedS}s (declared timeout=${row.tool_declared_timeout_ms ?? 'none'})`);
+      } else {
+        log(`[state] turn=${elapsedS}s, no tool in flight (waiting on SDK)`);
+      }
+    } catch (err) {
+      log(`[state] log failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
   // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
@@ -324,6 +351,7 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   const pollHandle = setInterval(() => {
     if (done) return;
+    logInflightState();
 
     // Restart sentinel takes priority over delivering follow-ups: if a tool
     // armed a restart (OAuth magic link, etc.), don't push new messages into

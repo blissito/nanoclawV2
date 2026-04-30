@@ -7,6 +7,7 @@ import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
+import Database from 'better-sqlite3';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
@@ -41,6 +42,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  outboundDbPath,
   sessionDir,
   writeSessionRouting,
 } from './session-manager.js';
@@ -168,7 +170,32 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
-    log.info('Container exited', { sessionId: session.id, code, containerName });
+    // Postmortem snapshot: read container_state to see what tool (if any)
+    // was in flight when the container died. Pairs with the docker-logs
+    // dump for fast triage of recurring hangs without grepping multiple
+    // files. Best-effort — readonly handle, swallowed errors.
+    let postmortem: { lastTool: string | null; toolStartedAt: string | null; toolElapsedMs: number | null } = {
+      lastTool: null,
+      toolStartedAt: null,
+      toolElapsedMs: null,
+    };
+    try {
+      const db = new Database(outboundDbPath(agentGroup.id, session.id), { readonly: true });
+      const row = db
+        .prepare('SELECT current_tool, tool_started_at FROM container_state WHERE id = 1')
+        .get() as { current_tool: string | null; tool_started_at: string | null } | undefined;
+      db.close();
+      if (row?.current_tool) {
+        postmortem = {
+          lastTool: row.current_tool,
+          toolStartedAt: row.tool_started_at,
+          toolElapsedMs: row.tool_started_at ? Date.now() - Date.parse(row.tool_started_at) : null,
+        };
+      }
+    } catch {
+      /* postmortem is best-effort — ignore failures */
+    }
+    log.info('Container exited', { sessionId: session.id, code, containerName, ...postmortem });
   });
 
   container.on('error', (err) => {
