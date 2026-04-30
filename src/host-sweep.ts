@@ -358,7 +358,13 @@ function resetStuckProcessingRows(
   reason: string,
 ): void {
   const claims = getProcessingClaims(outDb);
-  if (claims.length === 0) return;
+  const completedCount = (
+    outDb
+      .prepare("SELECT COUNT(*) as c FROM processing_ack WHERE status IN ('completed', 'failed')")
+      .get() as { c: number }
+  ).c;
+
+  if (claims.length === 0 && completedCount === 0) return;
 
   // Open a short-lived writable handle to outbound.db so we can clean orphan
   // processing_ack rows. The shared `outDb` is opened readonly to preserve
@@ -375,41 +381,68 @@ function resetStuckProcessingRows(
     const clearClaim = outWriter.prepare('DELETE FROM processing_ack WHERE message_id = ?');
 
     for (const { message_id } of claims) {
-      const msg = getMessageForRetry(inDb, message_id, 'pending');
-      if (!msg) {
-        // Orphan: inbound row is missing or no longer pending. The claim has
-        // no owner; clean it so the SLA stops tripping on it.
-        clearClaim.run(message_id);
-        log.info('Cleared orphan processing_ack', { messageId: message_id, sessionId: session.id, reason });
-        continue;
-      }
+      // Always clear the claim, even if the inDb write below fails. inDb can
+      // transiently flip to readonly (lock leak / stale journal), and if that
+      // throws before clearClaim, the claim becomes immortal and the SLA
+      // loops on it every 60s forever (prod incident 2026-04-29 02:00–02:38:
+      // 38 cycles on the same messageId, claimAgeMs growing past 13M ms).
+      try {
+        const msg = getMessageForRetry(inDb, message_id, 'pending');
+        if (!msg) {
+          log.info('Cleared orphan processing_ack', { messageId: message_id, sessionId: session.id, reason });
+          continue;
+        }
 
-      // Already rescheduled for a future retry — don't bump tries again.
-      // Drop the claim now (container is dead) so the next wake's fresh
-      // container doesn't have to rely on its own clearStaleProcessingAcks()
-      // running before the host SLA judges it.
-      if (msg.processAfter && Date.parse(msg.processAfter) > now) {
-        clearClaim.run(message_id);
-        continue;
-      }
+        if (msg.processAfter && Date.parse(msg.processAfter) > now) {
+          continue;
+        }
 
-      if (msg.tries >= MAX_TRIES) {
-        markMessageFailed(inDb, msg.id);
-        clearClaim.run(msg.id);
-        log.warn('Message marked as failed after max retries', {
-          messageId: msg.id,
+        if (msg.tries >= MAX_TRIES) {
+          markMessageFailed(inDb, msg.id);
+          log.warn('Message marked as failed after max retries', {
+            messageId: msg.id,
+            sessionId: session.id,
+            reason,
+          });
+        } else {
+          const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
+          const backoffSec = Math.floor(backoffMs / 1000);
+          retryWithBackoff(inDb, msg.id, backoffSec);
+          log.info('Reset stale message with backoff', {
+            messageId: msg.id,
+            tries: msg.tries,
+            backoffMs,
+            reason,
+          });
+        }
+      } catch (err) {
+        log.error('inDb write failed during reset — clearing claim anyway to avoid SLA loop', {
+          messageId: message_id,
           sessionId: session.id,
           reason,
+          err,
         });
-      } else {
-        const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
-        const backoffSec = Math.floor(backoffMs / 1000);
-        retryWithBackoff(inDb, msg.id, backoffSec);
-        clearClaim.run(msg.id);
-        log.info('Reset stale message with backoff', {
-          messageId: msg.id,
-          tries: msg.tries,
-          backoffMs,
+      } finally {
+        try {
+          clearClaim.run(message_id);
+        } catch (err) {
+          log.error('Failed to clear processing_ack claim', { messageId: message_id, err });
+        }
+      }
+    }
+
+    // Also reap completed/failed rows. syncProcessingAcks() in the sweep loop
+    // marks inbound as completed but leaves the outbound row in place because
+    // outDb is readonly there. Without this, processing_ack grows unbounded
+    // (prod incident: 311 'completed' rows accumulated over 4 days).
+    if (completedCount > 0) {
+      const reaped = outWriter
+        .prepare("DELETE FROM processing_ack WHERE status IN ('completed', 'failed')")
+        .run();
+      if (reaped.changes > 0) {
+        log.info('Reaped completed processing_ack rows', {
+          sessionId: session.id,
+          count: reaped.changes,
           reason,
         });
       }
