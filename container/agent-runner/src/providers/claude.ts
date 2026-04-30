@@ -152,6 +152,10 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
  * block the call here instead of letting the agent hang.
  */
+// Tracks last tool start so we can log duration in PostToolUse. Map keyed by
+// tool name — adequate because the SDK serializes tool calls per turn.
+const toolStartedAt = new Map<string, number>();
+
 const preToolUseHook: HookCallback = async (input) => {
   const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
   const toolName = i.tool_name ?? '';
@@ -165,6 +169,16 @@ const preToolUseHook: HookCallback = async (input) => {
   // tool: no declared timeout.
   const declaredTimeoutMs =
     toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+  toolStartedAt.set(toolName, Date.now());
+  // Compact one-line log of what the agent is starting. For Bash include
+  // the first 80 chars of the command so the dump-on-kill log shows what
+  // shell command was running. Other tools: just the name.
+  let inputHint = '';
+  if (toolName === 'Bash' && typeof i.tool_input?.command === 'string') {
+    const cmd = (i.tool_input.command as string).replace(/\s+/g, ' ').slice(0, 80);
+    inputHint = ` cmd="${cmd}"`;
+  }
+  log(`[tool] start: ${toolName}${declaredTimeoutMs ? ` (timeout=${declaredTimeoutMs}ms)` : ''}${inputHint}`);
   try {
     setContainerToolInFlight(toolName, declaredTimeoutMs);
   } catch (err) {
@@ -174,7 +188,16 @@ const preToolUseHook: HookCallback = async (input) => {
 };
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
-const postToolUseHook: HookCallback = async () => {
+const postToolUseHook: HookCallback = async (input) => {
+  const i = input as { tool_name?: string };
+  const toolName = i.tool_name ?? '';
+  const startedAt = toolStartedAt.get(toolName);
+  if (startedAt) {
+    log(`[tool] end: ${toolName} (${Date.now() - startedAt}ms)`);
+    toolStartedAt.delete(toolName);
+  } else {
+    log(`[tool] end: ${toolName}`);
+  }
   try {
     clearContainerToolInFlight();
   } catch (err) {
