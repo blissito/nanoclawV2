@@ -50,9 +50,11 @@ Each channel gets its own agent with its own workspace, memory, and personality.
 
 ## How to Decide
 
-The key question: **Are you okay with any and every piece of information from one channel being available in the other?**
+**Default: separate agent groups (level 3).** New channels get their own agent — own folder, own memory, own container — unless the user explicitly asks to share. This is the only safe default: shared memory between channels cross-pollinates, and an agent serving multiple chats can send notifications to the wrong one. Tighten the isolation when you have a real reason; don't loosen it by default.
 
-- **No** → Separate agent groups (level 3)
+The deciding question: **Has the user explicitly asked for this channel to share state with another?**
+
+- **No** (default) → Separate agent groups (level 3)
 - **Yes, and the channels should see each other's messages** → Shared session (level 1)
 - **Yes, but the conversations should be independent** → Same agent, separate sessions (level 2)
 
@@ -60,18 +62,18 @@ The key question: **Are you okay with any and every piece of information from on
 
 | Scenario | Recommended Level |
 |----------|------------------|
-| Just you, multiple platforms (Telegram + Discord + Slack) | Same agent, separate sessions |
-| Just you, multiple groups on one platform (3 Telegram chats) | Same agent, separate sessions |
-| Webhook channel + chat channel (GitHub + Slack) | Shared session |
+| Default for any new channel | Separate agent groups |
+| Webhook channel + chat channel (GitHub + Slack) for the *same* project | Shared session |
+| Multiple platforms where the user wants one unified assistant identity | Same agent, separate sessions |
 | Channel with friend A and channel with friend B | Separate agent groups |
 | Personal channel and work channel | Separate agent groups |
 | Team channel with different access levels | Separate agent groups |
 
 ### When in Doubt
 
-If the participants are the same across channels → same agent group is usually fine.
+Pick separate agent groups. Information will cross-pollinate through agent memory and notifications if you share state without intent — and untangling it later requires a manual migration (`migrate_to_separate_agent`).
 
-If different people are involved → separate agent groups. Information will cross-pollinate through agent memory if you don't.
+The host enforces this: if the caller passes nothing for `isolation`, both `register_channel` and `create_group` default to `separate-agent` and auto-derive the folder from the channel name.
 
 ## Entity Model
 

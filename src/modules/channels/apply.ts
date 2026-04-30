@@ -51,6 +51,31 @@ function isolationToSessionMode(iso: Isolation): 'agent-shared' | 'shared' {
   return 'shared';
 }
 
+// Folder derivation for isolation="separate-agent" when the caller does not
+// pass an explicit folder. Slugify the chat name; on collision append a
+// counter so we never silently reuse another agent group's folder — that
+// would defeat the point of separate-agent isolation.
+function slugifyFolder(input: string): string {
+  const slug = input
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return slug || `group-${Date.now()}`;
+}
+
+function deriveUniqueFolder(name: string): string {
+  const base = slugifyFolder(name);
+  if (!getAgentGroupByFolder(base)) return base;
+  for (let i = 2; i < 100; i++) {
+    const candidate = `${base}-${i}`;
+    if (!getAgentGroupByFolder(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}`;
+}
+
 /**
  * Sanitize a regex source the LLM may have written in JS regex-literal form.
  *
@@ -157,13 +182,21 @@ export async function applyRegisterChannel(
   const platform_id = content.platform_id as string;
   const channel_type = content.channel_type as string;
   const name = content.name as string;
-  const isolation = content.isolation as Isolation;
-  const folder = content.folder as string | undefined;
+  // Default to full isolation: a new agent group with its own folder, memory,
+  // and container. Set to prevent the cross-group notification leak we hit
+  // when channels shared an agent (2026-04-30).
+  const isolation = (content.isolation as Isolation | undefined) ?? 'separate-agent';
+  let folder = content.folder as string | undefined;
+  if (isolation === 'separate-agent' && !folder) {
+    folder = deriveUniqueFolder(name);
+  }
   const explicitAgentGroupId = content.agent_group_id as string | undefined;
   const engage_mode = (content.engage_mode as EngageMode) || 'pattern';
   const rawPattern = (content.engage_pattern as string | null | undefined) ?? (engage_mode === 'pattern' ? '.' : null);
   const engage_pattern = sanitizeEnginePattern(rawPattern);
-  const unknown_sender_policy = (content.unknown_sender_policy as UnknownSenderPolicy) || 'request_approval';
+  // Default open: respond to everyone. The user wants new groups to be
+  // immediately useful without per-sender approval friction. Tighten on demand.
+  const unknown_sender_policy = (content.unknown_sender_policy as UnknownSenderPolicy) || 'public';
   const is_group = inferIsGroup(platform_id, channel_type, content.is_group as boolean | undefined);
   const assistant_name = (content.assistant_name as string | undefined) || ASSISTANT_NAME;
 
@@ -176,11 +209,7 @@ export async function applyRegisterChannel(
   // Resolve / create target agent group
   let targetAgentGroupId: string;
   if (isolation === 'separate-agent') {
-    if (!folder) {
-      notifyAgent(session, 'register_channel rejected: isolation="separate-agent" requires a folder name.');
-      return;
-    }
-    const existing = getAgentGroupByFolder(folder);
+    const existing = getAgentGroupByFolder(folder!);
     if (existing) {
       targetAgentGroupId = existing.id;
     } else {
@@ -199,7 +228,7 @@ export async function applyRegisterChannel(
       const agentGroup = {
         id: newId,
         name: assistant_name,
-        folder,
+        folder: folder!,
         agent_provider: 'claude',
         created_at: new Date().toISOString(),
       };
@@ -408,21 +437,26 @@ export async function applyCreateGroup(
     return;
   }
 
-  const isolation = (content.isolation as Isolation | undefined) ?? 'separate-session';
-  const folder = content.folder as string | undefined;
+  // Default to full isolation: a new agent group per chat. Prevents the
+  // cross-group notification leak we hit when channels shared an agent
+  // (2026-04-30).
+  const isolation = (content.isolation as Isolation | undefined) ?? 'separate-agent';
+  let folder = content.folder as string | undefined;
   if (isolation === 'separate-agent' && !folder) {
-    notifyAgent(session, 'create_group rejected: isolation="separate-agent" requires a folder name.');
-    return;
+    folder = deriveUniqueFolder(name);
   }
 
   const explicitAgentGroupId = content.agent_group_id as string | undefined;
   const engage_mode = (content.engage_mode as EngageMode | undefined) ?? 'pattern';
+  // Default open: engage on every message ('.') and accept any sender.
+  // The user wants new groups to be immediately useful without mention-only
+  // gating or per-sender approval friction. Tighten on demand.
   const rawPattern =
     (content.engage_pattern as string | null | undefined) ??
-    (engage_mode === 'pattern' ? `\\b${ASSISTANT_NAME}\\b` : null);
+    (engage_mode === 'pattern' ? '.' : null);
   const engage_pattern = sanitizeEnginePattern(rawPattern);
   const unknown_sender_policy =
-    (content.unknown_sender_policy as UnknownSenderPolicy | undefined) ?? 'request_approval';
+    (content.unknown_sender_policy as UnknownSenderPolicy | undefined) ?? 'public';
   const assistant_name = (content.assistant_name as string | undefined) || ASSISTANT_NAME;
 
   const userId = getLastInboundUserId(inDb);

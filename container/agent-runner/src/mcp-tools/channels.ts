@@ -34,7 +34,7 @@ export const registerChannel: McpToolDefinition = {
   tool: {
     name: 'register_channel',
     description:
-      'Wire a chat/group/channel to an agent group so the agent starts receiving messages from it. The caller must be owner or admin of the target agent group. Host validates synchronously.\n\nIsolation options (see docs/isolation-model.md):\n  • shared-session   — this channel joins the same conversation as the current agent\n  • separate-session — this channel shares the agent (workspace + memory) but has its own conversation thread\n  • separate-agent   — a brand-new agent group is created for this channel (requires folder name)',
+      'Wire a chat/group/channel to an agent group so the agent starts receiving messages from it. The caller must be owner or admin of the target agent group. Host validates synchronously.\n\nDefaults (omit to get them):\n  • isolation="separate-agent" — a brand-new agent group with its own folder, memory, and container. Folder is auto-derived from name (slugified).\n  • engage_pattern="." — engages on every message (no mention-only gating).\n  • unknown_sender_policy="public" — accepts any sender.\n\nFilosofía: each new channel = dedicated, isolated, open assistant. Tighten on demand.\n\nIsolation options (see docs/isolation-model.md):\n  • separate-agent   — a brand-new agent group (default). Folder optional; auto-derived from name.\n  • separate-session — shares the calling agent (workspace + memory) but has its own conversation thread. Use when the user explicitly asks for shared memory.\n  • shared-session   — feeds messages into the same conversation as the calling agent. Use only for tightly coupled channels for the same project.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -53,11 +53,11 @@ export const registerChannel: McpToolDefinition = {
         isolation: {
           type: 'string',
           enum: [...VALID_ISOLATION],
-          description: 'How this channel relates to agent groups. See tool description.',
+          description: 'How this channel relates to agent groups. Default: "separate-agent" (full isolation). See tool description for the other options.',
         },
         folder: {
           type: 'string',
-          description: 'Folder name under groups/ for isolation="separate-agent" (e.g. "family-chat"). Ignored otherwise.',
+          description: 'Folder name under groups/ for isolation="separate-agent". Optional — host auto-derives from `name` via slugify (collision: appends `-2`/`-3`).',
         },
         agent_group_id: {
           type: 'string',
@@ -70,12 +70,12 @@ export const registerChannel: McpToolDefinition = {
         },
         engage_pattern: {
           type: 'string',
-          description: 'Regex for engage_mode="pattern". Use "." for "always engage". For a group piggyback-WhatsApp, usually "\\\\b<assistant-name>\\\\b/i".',
+          description: 'Regex for engage_mode="pattern". Default: "." (engage on every message). Use "\\\\b<assistant-name>\\\\b" for mention-only on piggyback-WhatsApp groups.',
         },
         unknown_sender_policy: {
           type: 'string',
           enum: [...VALID_POLICY],
-          description: 'What to do with messages from senders who are not owner/admin/member. "strict"=drop silently. "request_approval"=DM owner for approval (default). "public"=accept any sender.',
+          description: 'Sender gate. Default: "public" (accept any sender). "request_approval"=DM owner to approve new senders. "strict"=drop silently if not owner/admin/member.',
         },
         is_group: {
           type: 'boolean',
@@ -86,20 +86,20 @@ export const registerChannel: McpToolDefinition = {
           description: 'Assistant display name for isolation="separate-agent" (defaults to the current agent name).',
         },
       },
-      required: ['platform_id', 'channel_type', 'name', 'isolation'],
+      required: ['platform_id', 'channel_type', 'name'],
     },
   },
   async handler(args) {
     const platform_id = args.platform_id as string;
     const channel_type = args.channel_type as string;
     const name = args.name as string;
-    const isolation = args.isolation as (typeof VALID_ISOLATION)[number];
+    const isolation = (args.isolation as (typeof VALID_ISOLATION)[number] | undefined) ?? 'separate-agent';
 
     if (!platform_id || !channel_type || !name) return err('platform_id, channel_type, and name are required');
     if (!VALID_ISOLATION.includes(isolation)) return err(`isolation must be one of: ${VALID_ISOLATION.join(', ')}`);
 
+    // Folder is optional even for separate-agent — host auto-derives from name when omitted.
     const folder = args.folder as string | undefined;
-    if (isolation === 'separate-agent' && !folder) return err('folder is required when isolation="separate-agent"');
 
     const engage_mode = (args.engage_mode as string | undefined) || 'pattern';
     if (!VALID_ENGAGE.includes(engage_mode as (typeof VALID_ENGAGE)[number])) {
@@ -114,7 +114,7 @@ export const registerChannel: McpToolDefinition = {
       }
     }
 
-    const unknown_sender_policy = (args.unknown_sender_policy as string | undefined) || 'request_approval';
+    const unknown_sender_policy = (args.unknown_sender_policy as string | undefined) || 'public';
     if (!VALID_POLICY.includes(unknown_sender_policy as (typeof VALID_POLICY)[number])) {
       return err(`unknown_sender_policy must be one of: ${VALID_POLICY.join(', ')}`);
     }
@@ -224,7 +224,7 @@ export const createGroup: McpToolDefinition = {
         isolation: {
           type: 'string',
           enum: [...VALID_ISOLATION],
-          description: 'How the new group relates to agent groups. Defaults to "separate-session" (same agent as the caller, independent conversation thread).',
+          description: 'How the new group relates to agent groups. Default: "separate-agent" (full isolation: own folder, memory, container). Use "separate-session" or "shared-session" only when the user explicitly asks for shared state.',
         },
         agent_group_id: {
           type: 'string',
@@ -232,21 +232,21 @@ export const createGroup: McpToolDefinition = {
         },
         folder: {
           type: 'string',
-          description: 'Folder name under groups/ if isolation="separate-agent" (e.g. "family-chat"). Ignored otherwise.',
+          description: 'Folder name under groups/ for isolation="separate-agent". Optional — host auto-derives from `name` via slugify (collision: appends `-2`/`-3`).',
         },
         engage_mode: {
           type: 'string',
           enum: [...VALID_ENGAGE],
-          description: 'Engage mode for the wiring. Defaults to "pattern" with engage_pattern="\\\\b<assistant-name>\\\\b".',
+          description: 'Engage mode for the wiring. Default: "pattern" with engage_pattern=".".',
         },
         engage_pattern: {
           type: 'string',
-          description: 'Regex source string for engage_mode="pattern". Use `\\\\b[Gg]hosty\\\\b` style. NEVER use `/pattern/i` literal-flags style — JS new RegExp will treat it as literal characters. Default: bare assistant name in word boundaries.',
+          description: 'Regex source string for engage_mode="pattern". Default: "." (engage on every message). Use `\\\\b[Gg]hosty\\\\b` style for mention-only. NEVER use `/pattern/i` literal-flags style — JS new RegExp will treat it as literal characters.',
         },
         unknown_sender_policy: {
           type: 'string',
           enum: [...VALID_POLICY],
-          description: 'Default "request_approval". For a brand-new group where you may invite friends/colleagues this is the right default — first time someone new writes you get a DM to approve.',
+          description: 'Sender gate. Default: "public" (accepts any sender — new group ready to use immediately). "request_approval" gates new senders behind a DM to the owner. "strict" silently drops everyone not owner/admin/member.',
         },
         assistant_name: {
           type: 'string',
@@ -262,13 +262,11 @@ export const createGroup: McpToolDefinition = {
       return err('name is required');
     }
 
-    const isolation = (args.isolation as string | undefined) ?? 'separate-session';
+    const isolation = (args.isolation as string | undefined) ?? 'separate-agent';
     if (!VALID_ISOLATION.includes(isolation as (typeof VALID_ISOLATION)[number])) {
       return err(`isolation must be one of: ${VALID_ISOLATION.join(', ')}`);
     }
-    if (isolation === 'separate-agent' && !args.folder) {
-      return err('folder is required when isolation="separate-agent"');
-    }
+    // Folder is optional — host auto-derives from name when omitted.
 
     const engage_mode = (args.engage_mode as string | undefined) ?? 'pattern';
     if (!VALID_ENGAGE.includes(engage_mode as (typeof VALID_ENGAGE)[number])) {
@@ -283,7 +281,7 @@ export const createGroup: McpToolDefinition = {
       }
     }
 
-    const unknown_sender_policy = (args.unknown_sender_policy as string | undefined) ?? 'request_approval';
+    const unknown_sender_policy = (args.unknown_sender_policy as string | undefined) ?? 'public';
     if (!VALID_POLICY.includes(unknown_sender_policy as (typeof VALID_POLICY)[number])) {
       return err(`unknown_sender_policy must be one of: ${VALID_POLICY.join(', ')}`);
     }

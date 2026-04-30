@@ -66,27 +66,31 @@ Use when the user asks to "add a group," "register this chat," "make you respond
 
 ### Picking `isolation`
 
-- **`shared-session`** — this new channel feeds messages into the same conversation as the calling agent. Use when the user wants one conversation spanning multiple channels (e.g. GitHub notifications + Slack chat).
-- **`separate-session`** — shares workspace + memory with the calling agent, but has its own conversation thread. **Default for most cases**: one user across multiple chats/groups.
-- **`separate-agent`** — brand-new agent with its own workspace, memory, and personality. Use when different people are involved, or privacy/confidentiality should be enforced between chats. Requires `folder` (e.g. `"family-chat"`).
+**Default: `separate-agent`.** Cross-channel memory leak (notifications to the wrong chat, info from one client appearing in another) is a real failure mode. Start with full isolation; share state only on explicit user request.
 
-If unsure, ask the user: *"¿Quieres que sea yo mismo respondiendo ahí (compartiendo memoria), o un asistente distinto?"*
+- **`separate-agent`** (default) — brand-new agent with its own workspace, memory, and personality. The host auto-derives `folder` from `name` when omitted (e.g. `"Familia Cash"` → `familia-cash`, with `-2/-3` suffix on collision).
+- **`separate-session`** — shares workspace + memory with the calling agent, but has its own conversation thread. Use when the user explicitly says *"que sea el mismo asistente"* / *"comparte memoria con X"*.
+- **`shared-session`** — feeds messages into the same conversation as the calling agent. Use only for tightly coupled channels for the same project (e.g. GitHub notifications + Slack chat).
+
+If the user is ambiguous, default to `separate-agent` and mention it briefly so they can override. Don't ask before wiring unless they used the words "mismo asistente" / "comparte" / "junto con".
 
 ### Picking `engage_mode` + `engage_pattern`
 
-Groups on WhatsApp in piggyback mode (bot shares your number) **cannot use `mention`** — you cannot @-mention your own number. Use `pattern`.
+**Default: `engage_mode="pattern"`, `engage_pattern="."`** — engages on every message. The user wants new groups to be immediately useful; mention-only gating is opt-in.
 
-- Group with many people: `engage_mode="pattern"`, `engage_pattern="\\b[Gg]hosty\\b"` → activates when someone types the assistant's name.
-- Small group / intended to always respond: `engage_mode="pattern"`, `engage_pattern="."` → responds to everything.
-- 1:1 DM: `engage_mode="pattern"`, `engage_pattern="."`.
+Groups on WhatsApp in piggyback mode (bot shares your number) **cannot use `mention`** — you cannot @-mention your own number. Always use `pattern` there.
 
-On Slack/Discord/Telegram with threads: `engage_mode="mention"` or `mention-sticky` is fine.
+- Default for any new channel: `engage_pattern="."`.
+- User explicitly asks for mention-only ("solo cuando me menciones"): `engage_pattern="\\b[Gg]hosty\\b"`.
+- On Slack/Discord/Telegram with threads, when mention-gating is desired: `engage_mode="mention"` or `mention-sticky`.
 
 ### Picking `unknown_sender_policy`
 
-- **`strict`** — only owner/admin/member. Silent drop for everyone else.
-- **`request_approval`** (default) — first time someone new writes, DM arrives to the owner asking to allow them. Safe default for groups.
-- **`public`** — anyone can write. Use for fully open channels.
+**Default: `public`** — accepts any sender. The user wants new groups to respond to everyone without per-sender approval friction. Tighten on demand.
+
+- **`public`** (default) — anyone can write. Default for new groups.
+- **`request_approval`** — first time someone new writes, DM arrives to the owner asking to allow them. Use when the user explicitly asks for an approval gate ("que solo respondan los que apruebe").
+- **`strict`** — only owner/admin/member. Silent drop for everyone else. Use only for closed groups where the user wants total lockdown.
 
 ### Privilege
 
@@ -103,7 +107,7 @@ Call:
   "platform_id": "120363...@g.us",
   "channel_type": "whatsapp",
   "name": "Familia",
-  "isolation": "separate-session",
+  "isolation": "separate-agent",
   "engage_mode": "pattern",
   "engage_pattern": "\\b[Gg]hosty\\b",
   "unknown_sender_policy": "request_approval",
