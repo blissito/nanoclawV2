@@ -60,9 +60,10 @@ try {
     return platformType ? platformType.toString() : '1';
   };
 } catch {
-  // If CJS require fails (Node version mismatch), pairing codes may not work
-  // but QR auth will still function fine.
-  log.warn('Could not patch getPlatformId — pairing code auth may fail');
+  // CJS require failed (Node version mismatch): pairing-code auth path is
+  // unavailable, QR auth still works. Demoted to info — most installs never
+  // use pairing codes, so this is not actionable.
+  log.info('getPlatformId patch skipped (pairing-code auth unavailable, QR works)');
 }
 
 const baileysLogger = pino({ level: 'silent' });
