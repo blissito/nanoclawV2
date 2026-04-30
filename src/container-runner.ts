@@ -179,16 +179,51 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 }
 
+/**
+ * Best-effort: dump the last 500 lines of a container's stdout/stderr to
+ * logs/container-deaths/<sessionId>-<ts>.log before we kill it. Synchronous
+ * `docker logs` with a short timeout — if it hangs or fails we just skip.
+ * Without this, every hang kill leaves us blind to what the agent was doing.
+ */
+function dumpContainerLogsBeforeKill(sessionId: string, containerName: string, reason: string): void {
+  try {
+    const dir = path.join(DATA_DIR, '..', 'logs', 'container-deaths');
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const filePath = path.join(dir, `${sessionId}-${ts}.log`);
+    const out = execSync(`${CONTAINER_RUNTIME_BIN} logs --tail 500 ${containerName} 2>&1`, {
+      timeout: 5000,
+      stdio: 'pipe',
+    });
+    fs.writeFileSync(filePath, `# Killed: ${reason}\n# Container: ${containerName}\n# At: ${ts}\n\n${out}`);
+    log.info('Container logs dumped', { sessionId, containerName, filePath });
+  } catch (err) {
+    log.debug('Failed to dump container logs before kill', { sessionId, containerName, err });
+  }
+}
+
 /** Kill a container for a session. */
 export function killContainer(sessionId: string, reason: string): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  dumpContainerLogsBeforeKill(sessionId, entry.containerName, reason);
+
   try {
     stopContainer(entry.containerName);
-  } catch {
-    entry.process.kill('SIGKILL');
+  } catch (err) {
+    // stopContainer is `docker stop -t 1`; if even that fails (daemon stuck,
+    // container in unkillable state), fall back to SIGKILL via `docker kill`
+    // — bypasses any in-container signal handler. Last resort: kill the
+    // host-side child process holding the docker run pipe.
+    log.warn('stopContainer failed, escalating to docker kill', { sessionId, containerName: entry.containerName, err });
+    try {
+      execSync(`${CONTAINER_RUNTIME_BIN} kill ${entry.containerName}`, { timeout: 3000, stdio: 'pipe' });
+    } catch (err2) {
+      log.warn('docker kill failed, falling back to host child SIGKILL', { sessionId, err: err2 });
+      entry.process.kill('SIGKILL');
+    }
   }
 }
 
@@ -452,9 +487,27 @@ async function buildContainerArgs(
     'EASYBITS_API_KEY',
     'NANOCLAW_ADMIN_TOKEN',
     'GHOSTY_STUDIO_API_BASE',
+    'DEEPSEEK_API_KEY',
+    'FAL_KEY',
+    'OPENAI_API_KEY',
   ]);
   for (const [key, value] of Object.entries(passthroughEnv)) {
     if (value) args.push('-e', `${key}=${value}`);
+  }
+
+  // Container skills live under /app/skills/<name>/ (RO mount). Prepend each
+  // skill dir to PATH so agents can invoke scripts by name (e.g.
+  // `generate-image`, `describe-image`) instead of absolute paths.
+  const skillsHostDir = path.join(process.cwd(), 'container', 'skills');
+  if (fs.existsSync(skillsHostDir)) {
+    const skillDirs = fs
+      .readdirSync(skillsHostDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => `/app/skills/${e.name}`);
+    if (skillDirs.length > 0) {
+      const skillPath = skillDirs.join(':');
+      args.push('-e', `PATH=${skillPath}:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+    }
   }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
@@ -487,7 +540,7 @@ async function buildContainerArgs(
   // (from /api/oauth/google/access-token) is what authenticates these
   // requests, so we want them to skip the proxy entirely. Same pattern as
   // BrightData's NO_PROXY in mcp-tools/index.ts.
-  const googleMcpHosts = 'gmailmcp.googleapis.com,drivemcp.googleapis.com,calendarmcp.googleapis.com';
+  const googleMcpHosts = 'gmailmcp.googleapis.com,drivemcp.googleapis.com,calendarmcp.googleapis.com,api.deepseek.com,127.0.0.1,localhost,queue.fal.run,fal.run,fal.media,v3.fal.media,api.openai.com';
   args.push('-e', `NO_PROXY=${googleMcpHosts}`);
   args.push('-e', `no_proxy=${googleMcpHosts}`);
 

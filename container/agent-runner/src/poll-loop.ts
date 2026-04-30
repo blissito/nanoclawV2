@@ -171,6 +171,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+
+    // Container-side hard ceiling watchdog. If the SDK call hangs beyond
+    // QUERY_HARD_CEILING_MS with zero progress, exit(1) so docker tears the
+    // container down and the host respawns on the next message. More reliable
+    // than the host-side watchdog: bypasses any `docker stop` daemon issue,
+    // and runs from inside the same process so the kill is immediate.
+    // Tolerance is generous (10 min) — legit long bash skills like
+    // text-to-speech / video-from-html / agent-browser stay under it.
+    const QUERY_HARD_CEILING_MS = 10 * 60 * 1000;
+    const watchdog = setTimeout(() => {
+      log(`Hard ceiling watchdog fired (${QUERY_HARD_CEILING_MS}ms with no resolution) — exiting for respawn`);
+      process.exit(1);
+    }, QUERY_HARD_CEILING_MS);
+
     try {
       const result = await processQuery(query, routing, processingIds);
       if (result.continuation && result.continuation !== continuation) {
@@ -199,6 +213,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+    } finally {
+      clearTimeout(watchdog);
     }
 
     // Ensure completed even if processQuery ended without a result event

@@ -314,7 +314,7 @@ function enforceRunningContainerSla(
       toleranceMs: decision.toleranceMs,
     });
     killContainer(session.id, 'stalled-progress');
-    clearSdkSessionId(outDb);
+    clearSdkSessionId(outDb, agentGroupId, session.id);
     resetStuckProcessingRows(inDb, outDb, session, agentGroupId, 'stalled-progress');
     return;
   }
@@ -342,11 +342,20 @@ function lastOutboundTimestampMs(outDb: Database.Database): number {
   }
 }
 
-function clearSdkSessionId(outDb: Database.Database): void {
+function clearSdkSessionId(_outDb: Database.Database, agentGroupId: string, sessionId: string): void {
+  // outDb is opened readonly to preserve the single-writer invariant; we
+  // need a short-lived writable handle for this DELETE. Mirrors the same
+  // pattern used in resetStuckProcessingRows. The container is dead by the
+  // time this is called (post-kill on stalled-progress), so there is no
+  // concurrent writer to race with.
+  let writer: Database.Database | null = null;
   try {
-    outDb.prepare("DELETE FROM session_state WHERE key = 'sdk_session_id'").run();
+    writer = new Database(outboundDbPath(agentGroupId, sessionId));
+    writer.prepare("DELETE FROM session_state WHERE key = 'sdk_session_id'").run();
   } catch (err) {
     log.warn('Failed to clear sdk_session_id', { err });
+  } finally {
+    writer?.close();
   }
 }
 

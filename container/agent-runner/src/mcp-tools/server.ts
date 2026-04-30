@@ -45,7 +45,30 @@ export async function startMcpServer(): Promise<void> {
     if (!tool) {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
     }
-    return tool.handler(args ?? {});
+    // Per-handler timeout: most internal MCP tools just write to outbound.db
+    // and return immediately (fire-and-forget). If a handler hangs (network
+    // call, DB lock, runaway loop), the SDK's whole turn blocks — the agent
+    // can't even receive a tool_result, and the host watchdog has to kill
+    // the container. Cap individual handlers at 60s so a slow tool returns
+    // an error to the SDK and the turn keeps moving.
+    const HANDLER_TIMEOUT_MS = 60_000;
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<{ content: { type: 'text'; text: string }[]; isError: true }>(
+      (resolve) => {
+        timer = setTimeout(() => {
+          log(`tool "${name}" timed out after ${HANDLER_TIMEOUT_MS}ms`);
+          resolve({
+            content: [{ type: 'text', text: `Error: tool "${name}" timed out after ${HANDLER_TIMEOUT_MS / 1000}s` }],
+            isError: true,
+          });
+        }, HANDLER_TIMEOUT_MS);
+      },
+    );
+    try {
+      return await Promise.race([tool.handler(args ?? {}), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   });
 
   const transport = new StdioServerTransport();
