@@ -136,7 +136,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         panel-mcp@0.1.2 \
         smatch-mcp@1.7.2 \
         smatch-mcp-public@1.0.2 \
-        pptxgenjs@4.0.1
+        pptxgenjs@4.0.1 \
+        puppeteer-core@24.42.0
+
+# Make pnpm-global puppeteer-core importable from skill scripts. ESM ignores
+# NODE_PATH, so we symlink the package into /app/node_modules (bun's tree from
+# the agent-runner install). Node's ESM resolver walks up from
+# /app/skills/<skill>/<script> and finds it there. Robust against pnpm
+# changing its versioned global path because we resolve it via `pnpm root -g`.
+RUN ln -sf "$(pnpm root -g)/puppeteer-core" /app/node_modules/puppeteer-core
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh

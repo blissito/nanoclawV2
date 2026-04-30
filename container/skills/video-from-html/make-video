@@ -1,0 +1,212 @@
+#!/usr/bin/env node
+// make-video — render an HTML scene to MP4/GIF/WebP via headless Chromium + ffmpeg.
+// Contract: the HTML must define `window._tick(t)` with t ∈ [0, t-end].
+// See SKILL.md for full reference.
+
+import puppeteer from 'puppeteer-core';
+import { execSync, spawnSync } from 'node:child_process';
+import { mkdirSync, statSync, rmSync, existsSync } from 'node:fs';
+import { resolve, extname, basename } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const args = parseArgs(process.argv.slice(2));
+
+if (args.help || !args.html || !args.output) {
+  console.error(
+    'Usage: make-video --html <path> --output <path> [--frames N] [--fps N] [--width N] [--height N] [--t-end N] [--crf N] [--keep-frames]',
+  );
+  process.exit(args.help ? 0 : 2);
+}
+
+const htmlInput = args.html;
+const outputPath = resolve(args.output);
+const frames = parseInt(args.frames ?? '120', 10);
+const fps = parseInt(args.fps ?? '30', 10);
+const width = parseInt(args.width ?? '1280', 10);
+const height = parseInt(args.height ?? '720', 10);
+const tEnd = parseFloat(args['t-end'] ?? '1.0');
+const crf = parseInt(args.crf ?? '20', 10);
+const keepFrames = !!args['keep-frames'];
+
+const ext = extname(outputPath).toLowerCase();
+if (!['.mp4', '.gif', '.webp'].includes(ext)) {
+  console.error(`Unsupported output extension: ${ext}. Use .mp4, .gif, or .webp.`);
+  process.exit(2);
+}
+
+const chromiumPath = resolveChromium();
+const htmlUrl = toFileUrl(htmlInput);
+const framesDir = `${tmpdir()}/make-video-${process.pid}-${Date.now()}`;
+mkdirSync(framesDir, { recursive: true });
+
+console.log(`[make-video] chromium=${chromiumPath}`);
+console.log(`[make-video] html=${htmlUrl} viewport=${width}x${height} frames=${frames}@${fps}fps tEnd=${tEnd}`);
+console.log(`[make-video] frames dir=${framesDir} output=${outputPath}`);
+
+const browser = await puppeteer.launch({
+  executablePath: chromiumPath,
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-extensions',
+    '--allow-file-access-from-files',
+    '--disable-web-security',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--run-all-compositor-stages-before-draw',
+    '--force-color-profile=srgb',
+    `--window-size=${width},${height}`,
+  ],
+});
+
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width, height, deviceScaleFactor: 1 });
+  page.on('pageerror', (err) => console.error('[page-error]', err.message));
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') console.error('[page-console]', msg.text());
+  });
+
+  await page.goto(htmlUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+  // Settle: let fonts, late scripts, lazy images finish.
+  await wait(400);
+
+  const hasTick = await page.evaluate(() => typeof window._tick === 'function');
+  if (!hasTick) {
+    console.warn('[make-video] WARN: window._tick is not defined — animation will rely on CSS clock only.');
+  }
+
+  const t0 = Date.now();
+  for (let i = 0; i < frames; i++) {
+    const t = (i / Math.max(1, frames - 1)) * tEnd;
+    if (hasTick) {
+      await page.evaluate((tv) => window._tick(tv), t);
+    }
+    // Short repaint settle. Tunable via FRAME_SETTLE_MS env.
+    await wait(parseInt(process.env.FRAME_SETTLE_MS ?? '16', 10));
+    const file = `${framesDir}/frame_${String(i).padStart(5, '0')}.png`;
+    await page.screenshot({ path: file, type: 'png' });
+    if (i % Math.max(1, Math.floor(frames / 10)) === 0) {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      console.log(`[make-video]   frame ${i + 1}/${frames} (t=${t.toFixed(3)}) — ${elapsed}s`);
+    }
+  }
+  console.log(`[make-video] captured in ${((Date.now() - t0) / 1000).toFixed(1)}s — encoding…`);
+} finally {
+  await browser.close();
+}
+
+const ffArgs = ffmpegArgs({ ext, framesDir, fps, width, height, crf, outputPath });
+const ff = spawnSync('ffmpeg', ffArgs, { stdio: 'inherit' });
+if (ff.status !== 0) {
+  console.error(`[make-video] ffmpeg failed status=${ff.status}`);
+  process.exit(ff.status ?? 1);
+}
+
+if (!keepFrames) {
+  rmSync(framesDir, { recursive: true, force: true });
+}
+
+const sizeKb = (statSync(outputPath).size / 1024).toFixed(1);
+console.log(`[make-video] DONE: ${outputPath} (${sizeKb} KB)`);
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) continue;
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('--')) {
+      out[key] = true;
+    } else {
+      out[key] = next;
+      i++;
+    }
+  }
+  return out;
+}
+
+function resolveChromium() {
+  const candidates = [
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    process.env.AGENT_BROWSER_EXECUTABLE_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) return c;
+    } catch {}
+  }
+  try {
+    return execSync('which chromium').toString().trim();
+  } catch {
+    throw new Error('Chromium not found. Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH or install chromium.');
+  }
+}
+
+function toFileUrl(input) {
+  if (/^https?:\/\//i.test(input) || input.startsWith('file://')) return input;
+  return `file://${resolve(input)}`;
+}
+
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function ffmpegArgs({ ext, framesDir, fps, width, height, crf, outputPath }) {
+  const inputs = ['-y', '-framerate', String(fps), '-pattern_type', 'glob', '-i', `${framesDir}/frame_*.png`];
+  if (ext === '.mp4') {
+    return [
+      ...inputs,
+      '-c:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-crf',
+      String(crf),
+      '-movflags',
+      '+faststart',
+      '-vf',
+      `scale=${width}:${height}:flags=lanczos`,
+      outputPath,
+    ];
+  }
+  if (ext === '.gif') {
+    // Two-pass-in-one: split → palettegen → paletteuse for clean colors.
+    return [
+      ...inputs,
+      '-vf',
+      `fps=${fps},scale=${width}:${height}:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5`,
+      '-loop',
+      '0',
+      outputPath,
+    ];
+  }
+  // .webp
+  return [
+    ...inputs,
+    '-c:v',
+    'libwebp',
+    '-loop',
+    '0',
+    '-lossless',
+    '0',
+    '-q:v',
+    '70',
+    '-preset',
+    'picture',
+    '-an',
+    '-vf',
+    `scale=${width}:${height}:flags=lanczos`,
+    outputPath,
+  ];
+}

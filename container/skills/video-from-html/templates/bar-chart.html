@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bar-chart</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,system-ui,'Helvetica Neue',sans-serif}
+  html,body{width:1280px;height:720px;background:#0b1220;color:#fff;overflow:hidden}
+  .stage{padding:60px 80px;width:100%;height:100%;display:flex;flex-direction:column;gap:32px}
+  .title{font-size:42px;font-weight:700;letter-spacing:-1px;opacity:0;transform:translateY(-12px)}
+  .subtitle{font-size:20px;color:#94a3b8;opacity:0;margin-top:-22px}
+  .bars{flex:1;display:flex;flex-direction:column;justify-content:center;gap:18px}
+  .row{display:grid;grid-template-columns:220px 1fr 100px;align-items:center;gap:20px;opacity:0;transform:translateX(-16px)}
+  .row .name{font-size:22px;font-weight:500;color:#e2e8f0}
+  .row .track{height:32px;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden;position:relative}
+  .row .fill{height:100%;background:linear-gradient(90deg,var(--c1),var(--c2));border-radius:6px;width:0}
+  .row .val{font-size:22px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
+</style></head>
+<body>
+  <div class="stage">
+    <!-- EDIT TITLE/SUBTITLE -->
+    <div class="title" id="title">Top regiones por ventas</div>
+    <div class="subtitle" id="subtitle">Marzo 2026 · MXN miles</div>
+    <div class="bars" id="bars"></div>
+  </div>
+  <script>
+    // EDIT THIS DATA — { name, value (0..max), max, color1, color2 }
+    const DATA = [
+      { name: 'CDMX',       value: 1280, max: 1500, c1: '#60a5fa', c2: '#a78bfa' },
+      { name: 'Monterrey',  value:  940, max: 1500, c1: '#34d399', c2: '#60a5fa' },
+      { name: 'Guadalajara',value:  720, max: 1500, c1: '#f472b6', c2: '#a78bfa' },
+      { name: 'Puebla',     value:  430, max: 1500, c1: '#fbbf24', c2: '#f472b6' },
+      { name: 'Querétaro',  value:  310, max: 1500, c1: '#fb7185', c2: '#fbbf24' },
+    ];
+    const FORMATTER = (v) => '$' + v.toLocaleString('en-US');
+
+    const bars = document.getElementById('bars');
+    DATA.forEach((d, i) => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.dataset.i = i;
+      row.style.setProperty('--c1', d.c1);
+      row.style.setProperty('--c2', d.c2);
+      row.innerHTML = `
+        <div class="name">${d.name}</div>
+        <div class="track"><div class="fill"></div></div>
+        <div class="val">${FORMATTER(0)}</div>
+      `;
+      bars.appendChild(row);
+    });
+
+    const ease = (x) => 1 - Math.pow(1 - x, 3);
+    const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+    window._tick = function(t) {
+      const title = document.getElementById('title');
+      const sub = document.getElementById('subtitle');
+      const pT = ease(clamp01((t - 0.0) / 0.15));
+      title.style.opacity = pT;
+      title.style.transform = `translateY(${(1 - pT) * -12}px)`;
+      const pS = ease(clamp01((t - 0.10) / 0.18));
+      sub.style.opacity = pS;
+
+      // Stagger rows: each row gets its own [start, end] window.
+      const ROW_START = 0.20, ROW_END = 0.85;
+      const total = DATA.length;
+      Array.from(bars.children).forEach((row, i) => {
+        const a = ROW_START + (i / total) * 0.18;
+        const b = a + 0.45;
+        const p = ease(clamp01((t - a) / (b - a)));
+        row.style.opacity = p;
+        row.style.transform = `translateX(${(1 - p) * -16}px)`;
+        const fill = row.querySelector('.fill');
+        const val = row.querySelector('.val');
+        const d = DATA[i];
+        const target = d.value / d.max;
+        fill.style.width = (p * target * 100) + '%';
+        val.textContent = FORMATTER(Math.round(p * d.value));
+      });
+    };
+    window._tick(0);
+  </script>
+</body></html>
