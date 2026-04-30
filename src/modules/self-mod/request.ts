@@ -58,8 +58,8 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
     agentName: agentGroup.name,
     action: 'install_packages',
     payload: { apt, npm, reason },
-    title: 'Install Packages Request',
-    question: `Agent "${agentGroup.name}" is attempting to install a package + rebuild container:\n${packageList}${reason ? `\nReason: ${reason}` : ''}`,
+    title: 'Solicitud: instalar paquetes',
+    question: `El agente "${agentGroup.name}" quiere instalar un paquete y reconstruir su contenedor:\n${packageList}${reason ? `\nMotivo: ${reason}` : ''}`,
   });
 }
 
@@ -85,7 +85,7 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
       args: (content.args as string[]) || [],
       env: (content.env as Record<string, string>) || {},
     },
-    title: 'Add MCP Request',
-    question: `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n${serverName} (${command})`,
+    title: 'Solicitud: agregar MCP server',
+    question: `El agente "${agentGroup.name}" quiere agregar un MCP server nuevo:\n${serverName} (${command})`,
   });
 }

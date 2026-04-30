@@ -218,6 +218,51 @@ export const editMessage: McpToolDefinition = {
   },
 };
 
+/**
+ * Map common emoji shortcodes to raw unicode. Channel adapters (WhatsApp/
+ * Baileys) need the unicode character, not the shortcode string. Without
+ * this, the agent calls add_reaction with "eyes" and the user sees the
+ * literal text "eyes" as the reaction.
+ */
+const EMOJI_SHORTCODES: Record<string, string> = {
+  eyes: '👀',
+  white_check_mark: '✅',
+  check: '✅',
+  done: '✅',
+  x: '❌',
+  red_x: '❌',
+  failed: '❌',
+  thumbs_up: '👍',
+  thumbsup: '👍',
+  '+1': '👍',
+  thumbs_down: '👎',
+  thumbsdown: '👎',
+  '-1': '👎',
+  heart: '❤️',
+  red_heart: '❤️',
+  fire: '🔥',
+  rocket: '🚀',
+  warning: '⚠️',
+  bulb: '💡',
+  pray: '🙏',
+  clap: '👏',
+  ok_hand: '👌',
+  laughing: '😂',
+  joy: '😂',
+  sob: '😭',
+  thinking: '🤔',
+  hourglass: '⏳',
+  zap: '⚡',
+  sparkles: '✨',
+  tada: '🎉',
+};
+
+function resolveEmoji(input: string): string {
+  // Already unicode? (heuristic: short string containing emoji property)
+  if (/\p{Extended_Pictographic}/u.test(input)) return input;
+  return EMOJI_SHORTCODES[input.toLowerCase()] ?? input;
+}
+
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
@@ -251,7 +296,7 @@ export const addReaction: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ operation: 'reaction', messageId: platformId, emoji }),
+      content: JSON.stringify({ operation: 'reaction', messageId: platformId, emoji: resolveEmoji(emoji) }),
     });
 
     log(`add_reaction: #${seq} → ${emoji} on ${platformId}`);
@@ -259,4 +304,132 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-registerTools([sendMessage, sendFile, editMessage, addReaction]);
+/**
+ * WhatsApp-flavored group management tools. The host adapter routes these
+ * by `content.operation`. Bot must be admin of the target group; non-admin
+ * calls fail silently host-side (logged, no error to user).
+ */
+export const updateGroupSubject: McpToolDefinition = {
+  tool: {
+    name: 'update_group_subject',
+    description:
+      'Change the title/subject of the WhatsApp group this conversation is in. Bot must be admin.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        subject: { type: 'string', description: 'New group title (max 100 chars)' },
+        to: { type: 'string', description: 'Destination name (optional if single group)' },
+      },
+      required: ['subject'],
+    },
+  },
+  async handler(args) {
+    const subject = (args.subject as string)?.trim();
+    if (!subject) return err('subject is required');
+    if (subject.length > 100) return err('subject must be 100 chars or less');
+
+    const routing = resolveRouting(args.to as string | undefined);
+    if ('error' in routing) return err(routing.error);
+
+    const id = generateId();
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ operation: 'group_subject', subject }),
+    });
+    log(`update_group_subject: → ${routing.resolvedName}: "${subject}"`);
+    return ok(`Group title change queued for ${routing.resolvedName}`);
+  },
+};
+
+export const updateGroupPhoto: McpToolDefinition = {
+  tool: {
+    name: 'update_group_photo',
+    description:
+      "Change the photo/avatar of the WhatsApp group this conversation is in. Bot must be admin. Pass an image file path (relative to /workspace/agent/ or absolute).",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        path: { type: 'string', description: 'Path to image file (jpg/png)' },
+        to: { type: 'string', description: 'Destination name (optional if single group)' },
+      },
+      required: ['path'],
+    },
+  },
+  async handler(args) {
+    const filePath = args.path as string;
+    if (!filePath) return err('path is required');
+
+    const routing = resolveRouting(args.to as string | undefined);
+    if ('error' in routing) return err(routing.error);
+
+    const resolvedPath = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve('/workspace/agent', filePath);
+    if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
+
+    const id = generateId();
+    const filename = path.basename(resolvedPath);
+    const outboxDir = path.join('/workspace/outbox', id);
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
+
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ operation: 'group_photo', files: [filename] }),
+    });
+    log(`update_group_photo: → ${routing.resolvedName} (${filename})`);
+    return ok(`Group photo change queued for ${routing.resolvedName}`);
+  },
+};
+
+export const shareGroupInviteLink: McpToolDefinition = {
+  tool: {
+    name: 'share_group_invite_link',
+    description:
+      "Generate the WhatsApp group invite link and send it as a chat message. Bot must be admin. Optional `text` is prepended to the link.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        text: { type: 'string', description: 'Optional text to prepend (e.g., "Join our group:")' },
+        to: { type: 'string', description: 'Destination name (optional if single group)' },
+      },
+    },
+  },
+  async handler(args) {
+    const routing = resolveRouting(args.to as string | undefined);
+    if ('error' in routing) return err(routing.error);
+
+    const id = generateId();
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({
+        operation: 'group_invite_link',
+        text: (args.text as string) || '',
+      }),
+    });
+    log(`share_group_invite_link: → ${routing.resolvedName}`);
+    return ok(`Invite link send queued for ${routing.resolvedName}`);
+  },
+};
+
+registerTools([
+  sendMessage,
+  sendFile,
+  editMessage,
+  addReaction,
+  updateGroupSubject,
+  updateGroupPhoto,
+  shareGroupInviteLink,
+]);

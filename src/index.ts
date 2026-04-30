@@ -10,11 +10,13 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { upsertDiscoveredChannel } from './db/discovered-channels.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { startAdminServer, stopAdminServer } from './admin-server.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -107,6 +109,11 @@ async function main(): Promise<void> {
           name,
           isGroup,
         });
+        try {
+          upsertDiscoveredChannel(adapter.channelType, platformId, name ?? null, isGroup === true);
+        } catch (err) {
+          log.warn('Failed to upsert discovered channel', { channelType: adapter.channelType, platformId, err });
+        }
       },
       onAction(questionId, selectedOption, userId) {
         dispatchResponse({
@@ -147,6 +154,10 @@ async function main(): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
     },
+    async reactToMessage(channelType: string, platformId: string, messageId: string, emoji: string): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.reactToMessage?.(platformId, messageId, emoji);
+    },
   };
   setDeliveryAdapter(deliveryAdapter);
 
@@ -158,6 +169,9 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 7. Admin HTTP API for ghosty-studio (8787 by default)
+  startAdminServer();
 
   log.info('NanoClaw running');
 }
@@ -174,6 +188,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  await stopAdminServer();
   await teardownChannelAdapters();
   process.exit(0);
 }

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# generate-image: generate/edit images using fal.ai FLUX
+# Usage:
+#   generate-image "prompt"                                    # text-to-image (FLUX.2 pro)
+#   generate-image "prompt" /path/to/img1.png                  # edit with image (Kontext pro)
+#   generate-image "prompt" /path/to/img1.png /path/to/img2.png  # edit with multiple images
+set -euo pipefail
+
+PROMPT="${1:?Usage: generate-image \"prompt\" [source-image ...]}"
+shift
+SOURCE_IMAGES=("$@")
+OUTPUT_DIR="/workspace/agent"
+OUTPUT_FILE="${OUTPUT_DIR}/generated-$(date +%s%3N).jpg"
+
+if [[ -z "${FAL_KEY:-}" ]]; then
+  echo "ERROR: FAL_KEY not set" >&2
+  exit 1
+fi
+
+if [[ ${#SOURCE_IMAGES[@]} -gt 0 ]]; then
+  # Image editing via FLUX.1 Kontext [pro]
+  MODEL="fal-ai/flux-pro/kontext"
+  COST=0.04
+
+  # Encode first image as base64 data URI
+  IMAGE_URI=$(python3 -c "
+import base64, sys, mimetypes
+path = sys.argv[1]
+mime = mimetypes.guess_type(path)[0] or 'image/jpeg'
+with open(path, 'rb') as f:
+    print(f'data:{mime};base64,' + base64.b64encode(f.read()).decode())
+" "${SOURCE_IMAGES[0]}")
+
+  PAYLOAD=$(FLUX_PROMPT="$PROMPT" FLUX_IMAGE_URI="$IMAGE_URI" python3 -c "
+import json, os
+print(json.dumps({
+    'prompt': os.environ['FLUX_PROMPT'],
+    'image_url': os.environ['FLUX_IMAGE_URI'],
+    'output_format': 'jpeg',
+    'safety_tolerance': 5
+}))
+")
+else
+  # Text-to-image via FLUX.2 [pro]
+  MODEL="fal-ai/flux-2-pro"
+  COST=0.03
+
+  PAYLOAD=$(FLUX_PROMPT="$PROMPT" python3 -c "
+import json, os
+print(json.dumps({
+    'prompt': os.environ['FLUX_PROMPT'],
+    'aspect_ratio': '1:1',
+    'output_format': 'jpeg',
+    'safety_tolerance': 5
+}))
+")
+fi
+
+# Submit to fal.ai queue (payload via stdin to avoid ARG_MAX with large base64)
+RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -X POST "https://queue.fal.run/${MODEL}" \
+  -H "Authorization: Key $FAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d @-)
+
+# Check for immediate error
+ERROR=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if 'detail' in d:
+    print(d['detail'] if isinstance(d['detail'], str) else json.dumps(d['detail']))
+elif 'error' in d:
+    print(d['error'])
+" <<< "$RESPONSE" 2>/dev/null || true)
+
+if [[ -n "$ERROR" ]]; then
+  echo "ERROR: fal.ai: $ERROR" >&2
+  exit 1
+fi
+
+# Poll queue for result
+REQUEST_ID=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('request_id', ''))
+" <<< "$RESPONSE")
+
+if [[ -n "$REQUEST_ID" ]]; then
+  for i in $(seq 1 90); do
+    sleep 2
+    STATUS_RESPONSE=$(curl -sS "https://queue.fal.run/${MODEL}/requests/$REQUEST_ID/status" \
+      -H "Authorization: Key $FAL_KEY")
+    STATUS=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('status', ''))
+" <<< "$STATUS_RESPONSE")
+    if [[ "$STATUS" == "COMPLETED" ]]; then
+      RESPONSE=$(curl -sS "https://queue.fal.run/${MODEL}/requests/$REQUEST_ID" \
+        -H "Authorization: Key $FAL_KEY")
+      break
+    elif [[ "$STATUS" == "FAILED" ]]; then
+      echo "ERROR: fal.ai generation failed" >&2
+      exit 1
+    fi
+  done
+fi
+
+# Download result image
+IMAGE_URL=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+images = d.get('images', [])
+if images:
+    print(images[0].get('url', ''))
+else:
+    print('')
+" <<< "$RESPONSE")
+
+if [[ -z "$IMAGE_URL" ]]; then
+  echo "ERROR: No image URL in response" >&2
+  echo "Response: $RESPONSE" >&2
+  exit 1
+fi
+
+curl -sS -o "$OUTPUT_FILE" "$IMAGE_URL"
+
+
+echo "$OUTPUT_FILE"

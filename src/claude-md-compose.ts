@@ -115,11 +115,14 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   }
 
-  // Composed entry — imports only.
+  // Composed entry — imports only. CLAUDE.local.md is appended explicitly
+  // because Agent SDK uses settingSources=['project','user'] (no 'local'),
+  // so Claude Code's local auto-load does not apply inside the container.
   const imports = ['@./.claude-shared.md'];
   for (const name of [...desired.keys()].sort()) {
     imports.push(`@./.claude-fragments/${name}`);
   }
+  imports.push('@./CLAUDE.local.md');
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');
   writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
 

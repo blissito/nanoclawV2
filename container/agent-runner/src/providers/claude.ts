@@ -55,6 +55,11 @@ const TOOL_ALLOWLIST = [
   'Skill',
   'NotebookEdit',
   'mcp__nanoclaw__*',
+  'mcp__easybits__*',
+  'mcp__brightdata__*',
+  'mcp__gmail__*',
+  'mcp__drive__*',
+  'mcp__calendar__*',
 ];
 
 interface SDKUserMessage {
@@ -304,7 +309,22 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
+          const m = message as {
+            usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; service_tier?: string };
+            modelUsage?: Record<string, unknown>;
+          };
+          const u = m.usage;
+          const usage = u && typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number'
+            ? {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                service_tier: u.service_tier,
+              }
+            : undefined;
+          const model = m.modelUsage ? Object.keys(m.modelUsage)[0] : undefined;
+          yield { type: 'result', text, usage, model };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

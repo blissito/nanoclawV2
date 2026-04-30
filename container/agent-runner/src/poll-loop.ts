@@ -1,13 +1,25 @@
+import fs from 'fs';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { loadConfig } from './config.js';
+import { reportTurnUsage } from './usage-reporter.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+/**
+ * Sentinel a tool can drop to ask the container to exit cleanly at end-of-turn.
+ * The host's `--rm` plus session DB persistence means the next inbound message
+ * spawns a fresh container that resumes the same session — useful when a tool
+ * (e.g. google_workspace_status, after sending an OAuth magic link) knows the
+ * MCP server config will be stale until a respawn refreshes it.
+ */
+const RESTART_SENTINEL_PATH = '/workspace/.restart-requested';
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -159,6 +171,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+
+    // Container-side hard ceiling watchdog. If the SDK call hangs beyond
+    // QUERY_HARD_CEILING_MS with zero progress, exit(1) so docker tears the
+    // container down and the host respawns on the next message. More reliable
+    // than the host-side watchdog: bypasses any `docker stop` daemon issue,
+    // and runs from inside the same process so the kill is immediate.
+    // Tolerance is generous (10 min) — legit long bash skills like
+    // text-to-speech / video-from-html / agent-browser stay under it.
+    const QUERY_HARD_CEILING_MS = 10 * 60 * 1000;
+    const watchdog = setTimeout(() => {
+      log(`Hard ceiling watchdog fired (${QUERY_HARD_CEILING_MS}ms with no resolution) — exiting for respawn`);
+      process.exit(1);
+    }, QUERY_HARD_CEILING_MS);
+
     try {
       const result = await processQuery(query, routing, processingIds);
       if (result.continuation && result.continuation !== continuation) {
@@ -187,6 +213,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+    } finally {
+      clearTimeout(watchdog);
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -194,6 +222,36 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/**
+ * If a tool dropped the restart sentinel (e.g. google_workspace_status after
+ * sending an OAuth magic link), exit cleanly so the user's next message
+ * wakes a fresh container with up-to-date MCP wiring.
+ *
+ * NOTE: processQuery doesn't return between turns — the SDK keeps the query
+ * stream open for follow-ups (cheaper than reopening, preserves prompt cache).
+ * So this check has to fire FROM INSIDE processQuery: once after each result
+ * event, and again in the follow-up poll before pushing new input. Either
+ * triggers `process.exit(0)` and Docker `--rm` cleans up.
+ */
+function checkRestartSentinel(reason: string): void {
+  if (!fs.existsSync(RESTART_SENTINEL_PATH)) return;
+  console.error(`[poll-loop] Restart sentinel found (${reason}) — exiting so next message spawns a fresh container`);
+  try { fs.unlinkSync(RESTART_SENTINEL_PATH); } catch {}
+  // Clean up any 'processing' processing_ack rows in outbound.db before exit.
+  // Otherwise the host's next sweep tick races: it wakes a fresh container
+  // (because dueCount > 0), then in the SAME tick its claim-stuck check sees
+  // the lingering 'processing' row from this container, decides it's stuck,
+  // and kills the just-spawned successor before it can finish startup.
+  // The fresh container's own clearStaleProcessingAcks() at line 51 would
+  // handle this too, but only if it gets to run before the sweep tick.
+  try {
+    getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
+  } catch (e) {
+    console.error(`[poll-loop] failed to clear stale processing_ack pre-exit: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  process.exit(0);
 }
 
 /**
@@ -234,6 +292,17 @@ interface QueryResult {
   continuation?: string;
 }
 
+function currentMaxOutboundSeq(): number {
+  try {
+    const row = getOutboundDb()
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out')
+      .get() as { m: number };
+    return row.m;
+  } catch {
+    return 0;
+  }
+}
+
 async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
@@ -241,6 +310,11 @@ async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  // Snapshot before this turn so we can detect whether the turn produced any
+  // user-visible messages_out row (final reply OR mid-turn send_message MCP).
+  // If MAX(seq) didn't move past this, the turn was tool-only — skip usage
+  // reporting rather than fabricating an idempotency key.
+  let lastReportedSeq = currentMaxOutboundSeq();
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
@@ -250,6 +324,11 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   const pollHandle = setInterval(() => {
     if (done) return;
+
+    // Restart sentinel takes priority over delivering follow-ups: if a tool
+    // armed a restart (OAuth magic link, etc.), don't push new messages into
+    // a soon-to-be-stale query — exit and let the host respawn.
+    checkRestartSentinel('follow-up poll');
 
     // Skip system messages (MCP tool responses) and /clear (needs fresh query).
     // Thread routing is the router's concern — if a message landed in this
@@ -300,6 +379,32 @@ async function processQuery(
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
+        // Best-effort token-usage report. Only if the turn wrote at least
+        // one messages_out row (otherwise it was tool-only with no visible
+        // output → no idempotency anchor). Awaited but capped at 5s by the
+        // reporter; logged-and-swallowed on any failure.
+        const newMax = currentMaxOutboundSeq();
+        if (newMax > lastReportedSeq && event.usage && queryContinuation) {
+          try {
+            await reportTurnUsage({
+              agentGroupId: loadConfig().agentGroupId,
+              sessionId: queryContinuation,
+              turnIdempotencyKey: `${queryContinuation}:${newMax}`,
+              model: event.model || 'unknown',
+              usage: event.usage,
+              occurredAt: new Date(),
+              userId: routing.senderId ?? undefined,
+              messagingGroupId: routing.platformId ?? undefined,
+            });
+          } catch (e) {
+            console.error(`[poll-loop] usage report unexpected throw: ${e instanceof Error ? e.message : String(e)}`);
+          }
+          lastReportedSeq = newMax;
+        }
+        // Tool-armed restart: now that the user-facing message has been
+        // dispatched, it's safe to exit so the next inbound message wakes a
+        // fresh container with refreshed MCP wiring.
+        checkRestartSentinel('end of turn');
       }
     }
   } finally {

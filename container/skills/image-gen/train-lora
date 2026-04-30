@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# train-lora: train a FLUX LoRA on fal.ai from reference images
+# Usage:
+#   train-lora "trigger_word" /path/to/img1.jpg /path/to/img2.jpg ...
+#   train-lora "ghosty_plush" /workspace/attachments/img-*.jpg
+#
+# Requires 15-20 images. Cost: ~$2-3. Time: ~10 min.
+# Saves the LoRA URL to /workspace/agent/lora-<trigger>.json for use with generate-lora.
+set -euo pipefail
+
+TRIGGER="${1:?Usage: train-lora \"trigger_word\" image1 image2 ...}"
+shift
+IMAGES=("$@")
+
+if [[ -z "${FAL_KEY:-}" ]]; then
+  echo "ERROR: FAL_KEY not set" >&2
+  exit 1
+fi
+
+if [[ ${#IMAGES[@]} -lt 4 ]]; then
+  echo "ERROR: Need at least 4 images (15-20 recommended)" >&2
+  exit 1
+fi
+
+OUTPUT_DIR="/workspace/agent"
+LORA_FILE="${OUTPUT_DIR}/lora-${TRIGGER}.json"
+
+# Build images_data_url array (base64 data URIs)
+echo "Encoding ${#IMAGES[@]} images..." >&2
+IMAGE_URIS=$(python3 -c "
+import base64, sys, mimetypes, json
+uris = []
+for path in sys.argv[1:]:
+    mime = mimetypes.guess_type(path)[0] or 'image/jpeg'
+    with open(path, 'rb') as f:
+        uris.append({'url': f'data:{mime};base64,' + base64.b64encode(f.read()).decode(), 'caption': ''})
+print(json.dumps(uris))
+" "${IMAGES[@]}")
+
+# Build payload
+PAYLOAD=$(TRAIN_TRIGGER="$TRIGGER" TRAIN_IMAGES="$IMAGE_URIS" python3 -c "
+import json, os
+images = json.loads(os.environ['TRAIN_IMAGES'])
+print(json.dumps({
+    'images_data_url': images,
+    'trigger_word': os.environ['TRAIN_TRIGGER'],
+    'steps': 1000,
+    'create_masks': True,
+    'is_style': False,
+    'is_input_format_already_preprocessed': False
+}))
+")
+
+echo "Submitting training job (~10 min)..." >&2
+
+# Submit to fal.ai queue
+RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -X POST "https://queue.fal.run/fal-ai/flux-lora-fast-training" \
+  -H "Authorization: Key $FAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d @-)
+
+# Check for immediate error
+ERROR=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if 'detail' in d:
+    print(d['detail'] if isinstance(d['detail'], str) else json.dumps(d['detail']))
+elif 'error' in d:
+    print(d['error'])
+" <<< "$RESPONSE" 2>/dev/null || true)
+
+if [[ -n "$ERROR" ]]; then
+  echo "ERROR: fal.ai: $ERROR" >&2
+  exit 1
+fi
+
+# Poll queue for result (training takes ~10 min)
+REQUEST_ID=$(python3 -c "
+import json, sys
+print(json.load(sys.stdin).get('request_id', ''))
+" <<< "$RESPONSE")
+
+if [[ -z "$REQUEST_ID" ]]; then
+  echo "ERROR: No request_id in response" >&2
+  echo "Response: $RESPONSE" >&2
+  exit 1
+fi
+
+echo "Training started (request: $REQUEST_ID). Polling..." >&2
+for i in $(seq 1 300); do
+  sleep 4
+  STATUS_RESPONSE=$(curl -sS "https://queue.fal.run/fal-ai/flux-lora-fast-training/requests/$REQUEST_ID/status" \
+    -H "Authorization: Key $FAL_KEY")
+  STATUS=$(python3 -c "
+import json, sys
+print(json.load(sys.stdin).get('status', ''))
+" <<< "$STATUS_RESPONSE")
+
+  if [[ "$STATUS" == "COMPLETED" ]]; then
+    RESPONSE=$(curl -sS "https://queue.fal.run/fal-ai/flux-lora-fast-training/requests/$REQUEST_ID" \
+      -H "Authorization: Key $FAL_KEY")
+    break
+  elif [[ "$STATUS" == "FAILED" ]]; then
+    echo "ERROR: Training failed" >&2
+    exit 1
+  fi
+
+  # Progress update every 60s
+  if (( i % 15 == 0 )); then
+    echo "Still training... (${STATUS:-pending}, $(( i * 4 ))s elapsed)" >&2
+  fi
+done
+
+# Extract LoRA URL
+LORA_URL=$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+weights = d.get('diffusers_lora_file', {})
+print(weights.get('url', ''))
+" <<< "$RESPONSE")
+
+if [[ -z "$LORA_URL" ]]; then
+  echo "ERROR: No LoRA URL in response" >&2
+  echo "Response: $RESPONSE" >&2
+  exit 1
+fi
+
+# Save LoRA config
+python3 -c "
+import json, sys
+json.dump({
+    'trigger_word': sys.argv[1],
+    'lora_url': sys.argv[2],
+    'image_count': int(sys.argv[3])
+}, open(sys.argv[4], 'w'), indent=2)
+" "$TRIGGER" "$LORA_URL" "${#IMAGES[@]}" "$LORA_FILE"
+
+echo "LoRA trained and saved to $LORA_FILE" >&2
+echo "$LORA_FILE"

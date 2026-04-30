@@ -1,0 +1,65 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>quote-card</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,system-ui,Georgia,serif}
+  html,body{width:1080px;height:1080px;background:radial-gradient(ellipse at 30% 20%,#1e1b4b 0%,#0b1220 70%);color:#fff;overflow:hidden}
+  .stage{padding:90px;width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;gap:40px}
+  .mark{font-size:120px;line-height:1;color:rgba(167,139,250,.45);opacity:0;transform:translateY(-12px);font-family:Georgia,serif}
+  .quote{font-size:54px;font-weight:500;line-height:1.32;letter-spacing:-0.5px;color:#f8fafc}
+  .author{display:flex;align-items:center;gap:18px;margin-top:16px;opacity:0;transform:translateY(12px)}
+  .dot{width:48px;height:4px;background:linear-gradient(90deg,#a78bfa,#f472b6);border-radius:2px}
+  .author-name{font-size:24px;font-weight:600;color:#cbd5e1;font-family:-apple-system,system-ui,sans-serif}
+  .author-meta{font-size:18px;color:#94a3b8;font-family:-apple-system,system-ui,sans-serif}
+  .word{display:inline-block;opacity:0;transform:translateY(8px);transition:none}
+</style></head>
+<body>
+  <div class="stage">
+    <div class="mark" id="mark">"</div>
+    <div class="quote" id="quote"></div>
+    <div class="author" id="author">
+      <div class="dot"></div>
+      <div>
+        <!-- EDIT AUTHOR -->
+        <div class="author-name">Steve Jobs</div>
+        <div class="author-meta">1955–2011 · Apple</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    // EDIT THIS QUOTE
+    const QUOTE = "La gente que está suficientemente loca para creer que puede cambiar el mundo, es la que lo cambia.";
+
+    const quoteEl = document.getElementById('quote');
+    const words = QUOTE.split(/(\s+)/); // keep spaces
+    quoteEl.innerHTML = words.map(w => /^\s+$/.test(w) ? w : `<span class="word">${w}</span>`).join('');
+    const wordEls = quoteEl.querySelectorAll('.word');
+
+    const ease = (x) => 1 - Math.pow(1 - x, 3);
+    const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+    window._tick = function(t) {
+      const mark = document.getElementById('mark');
+      const author = document.getElementById('author');
+
+      const pM = ease(clamp01((t - 0.00) / 0.15));
+      mark.style.opacity = pM;
+      mark.style.transform = `translateY(${(1 - pM) * -12}px) scale(${0.9 + pM * 0.1})`;
+
+      // Word-by-word reveal between t=0.10 and t=0.75
+      const REVEAL_START = 0.10, REVEAL_END = 0.75;
+      const span = REVEAL_END - REVEAL_START;
+      wordEls.forEach((w, i) => {
+        const a = REVEAL_START + (i / wordEls.length) * span * 0.7;
+        const b = a + span * 0.3;
+        const p = ease(clamp01((t - a) / (b - a)));
+        w.style.opacity = p;
+        w.style.transform = `translateY(${(1 - p) * 8}px)`;
+      });
+
+      const pA = ease(clamp01((t - 0.78) / 0.18));
+      author.style.opacity = pA;
+      author.style.transform = `translateY(${(1 - pA) * 12}px)`;
+    };
+    window._tick(0);
+  </script>
+</body></html>

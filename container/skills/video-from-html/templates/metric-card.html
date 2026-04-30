@@ -1,0 +1,62 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>metric-card</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,system-ui,'Helvetica Neue',sans-serif}
+  html,body{width:1280px;height:720px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#fff;overflow:hidden}
+  .stage{width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px}
+  .label{font-size:24px;letter-spacing:6px;text-transform:uppercase;color:#94a3b8;opacity:0;transform:translateY(-12px)}
+  .number{font-size:240px;font-weight:800;letter-spacing:-6px;background:linear-gradient(135deg,#60a5fa,#a78bfa,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1;opacity:0}
+  .subtitle{font-size:32px;font-weight:500;color:#cbd5e1;opacity:0;transform:translateY(12px)}
+  .accent{width:0;height:4px;background:linear-gradient(90deg,#60a5fa,#a78bfa,#f472b6);border-radius:2px;margin-top:8px}
+</style></head>
+<body>
+  <div class="stage">
+    <!-- EDIT THESE STRINGS -->
+    <div class="label" id="label">Q1 2026 RESULTS</div>
+    <div class="number" id="number">$1.2M</div>
+    <div class="subtitle" id="subtitle">+38% vs trimestre anterior</div>
+    <div class="accent" id="accent"></div>
+  </div>
+  <script>
+    // Easing
+    const ease = (x) => 1 - Math.pow(1 - x, 3);
+    const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+    // Animation phases (start, end) on t∈[0,1]
+    const PHASES = {
+      label:    [0.00, 0.20],
+      number:   [0.10, 0.50],
+      subtitle: [0.40, 0.70],
+      accent:   [0.55, 0.85],
+    };
+
+    function phase(t, [a, b]) {
+      return ease(clamp01((t - a) / (b - a)));
+    }
+
+    window._tick = function(t) {
+      const lbl = document.getElementById('label');
+      const num = document.getElementById('number');
+      const sub = document.getElementById('subtitle');
+      const acc = document.getElementById('accent');
+
+      const pL = phase(t, PHASES.label);
+      lbl.style.opacity = pL;
+      lbl.style.transform = `translateY(${(1 - pL) * -12}px)`;
+
+      const pN = phase(t, PHASES.number);
+      num.style.opacity = pN;
+      num.style.transform = `scale(${0.92 + pN * 0.08})`;
+
+      const pS = phase(t, PHASES.subtitle);
+      sub.style.opacity = pS;
+      sub.style.transform = `translateY(${(1 - pS) * 12}px)`;
+
+      const pA = phase(t, PHASES.accent);
+      acc.style.width = `${pA * 320}px`;
+    };
+
+    // Set initial state
+    window._tick(0);
+  </script>
+</body></html>
