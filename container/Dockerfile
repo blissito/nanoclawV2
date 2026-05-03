@@ -108,13 +108,15 @@ ENV U2NET_HOME=/home/node/.u2net
 #
 #   - rapidocr-onnxruntime: PaddleOCR det+rec models exported to ONNX,
 #     bundled inside the wheel (no separate download).
-#   - fastembed: minimal embeddings runtime; pre-fetch multilingual-e5-small
-#     (~120MB) at build so the first agent call doesn't block on a download.
+#   - fastembed: minimal embeddings runtime; pre-fetch the multilingual MiniLM
+#     model (~220MB, 384-d, ~50 langs incl. Spanish) at build so the first
+#     agent call doesn't block on a download. (e5-small isn't supported in
+#     fastembed 0.8 — only e5-large at 2.24GB; MiniLM is the lighter pick.)
 RUN pip3 install --break-system-packages --no-cache-dir \
         rapidocr-onnxruntime \
         fastembed \
     && mkdir -p /home/node/.fastembed \
-    && python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='intfloat/multilingual-e5-small', cache_dir='/home/node/.fastembed')" \
+    && python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir='/home/node/.fastembed')" \
     && chown -R node:node /home/node/.fastembed
 
 # ---- Bun runtime -------------------------------------------------------------

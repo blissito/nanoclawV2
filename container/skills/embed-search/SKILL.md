@@ -6,7 +6,7 @@ allowed-tools: Bash(embed-search:*)
 
 # Semantic Search (free, local, multilingual)
 
-Search your workspace by *meaning*, not just keywords. Indexes `.md` / `.txt` files under any directory using `intfloat/multilingual-e5-small` (384-d, ~120MB, supports 90+ languages including Spanish & English) running on onnxruntime CPU.
+Search your workspace by *meaning*, not just keywords. Indexes `.md` / `.txt` files under any directory using `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-d, ~220MB, ~50 languages including Spanish & English) running on onnxruntime CPU.
 
 The index is cached on disk and incremental — only changed files re-embed on subsequent runs.
 
@@ -28,9 +28,9 @@ The index is cached on disk and incremental — only changed files re-embed on s
 
 1. Walks the directory recursively for `.md` / `.txt`.
 2. Splits each file into ~600-char overlapping chunks.
-3. Embeds with e5-small (multilingual, retrieval-tuned).
+3. Embeds with paraphrase-multilingual-MiniLM (no prefix needed).
 4. Stores vectors in `<dir>/.embed-index.json` (incremental — re-runs only embed changed/new files based on mtime+size).
-5. At query time, embeds the query with the `query:` prefix the model expects, cosine-ranks all chunks, returns top-N.
+5. At query time, embeds the query, cosine-ranks all chunks, returns top-N.
 
 ## Output
 

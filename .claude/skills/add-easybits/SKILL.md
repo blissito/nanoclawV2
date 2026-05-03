@@ -1,11 +1,13 @@
 ---
 name: add-easybits
-description: Add the EasyBits MCP server (@easybits.cloud/mcp) so the container agent can manage cloud file storage, images, webhooks, websites, and AI tasks. ~30 tools.
+description: Add the EasyBits MCP server (@easybits.cloud/mcp) so the container agent can manage cloud files, images, video/voice generation, designs, websites, forms, brand kits, characters, and a built-in DB. 65+ tools (server-side).
 ---
 
 # Add EasyBits
 
-Wires `@easybits.cloud/mcp` (stdio) into every NanoClaw container. The MCP server reads `EASYBITS_API_KEY` from env and sends `Authorization: Bearer ...` to `easybits.cloud`. With OneCLI, the env value is `placeholder` and the proxy rewrites the header at the host pattern.
+Wires `@easybits.cloud/mcp` (stdio) into every NanoClaw container. The MCP server is a thin proxy that reads `EASYBITS_API_KEY` from env and forwards JSON-RPC over HTTPS to `https://www.easybits.cloud/api/mcp?tools=<toolsets>`. The actual tool list and execution happen server-side.
+
+**Auth path:** Direct env var, NOT OneCLI proxy. The container's `EASYBITS_API_KEY` is read by the proxy at startup and used as `Authorization: Bearer ...` directly. We document a OneCLI secret as a backup (for vault rotation), but it isn't on the live request path.
 
 **Principle:** Do the work. Only ask the user when something genuinely needs human input.
 
@@ -42,13 +44,15 @@ Edit `container/agent-runner/src/index.ts`. Find the `mcpServers` block and add 
     },
     easybits: {
       command: 'npx',
-      args: ['-y', '@easybits.cloud/mcp'],
-      env: { EASYBITS_API_KEY: 'placeholder' },
+      args: ['-y', '@easybits.cloud/mcp', '--tools', process.env.EASYBITS_TOOLSETS || 'core,design,websites,forms'],
+      env: { EASYBITS_API_KEY: process.env.EASYBITS_API_KEY || '' },
     },
   };
 ```
 
-The literal string `placeholder` is required: the MCP server gates on truthy env; OneCLI rewrites the outbound `Authorization` header at the proxy.
+**Note:** the MCP server is a proxy — it reads `EASYBITS_API_KEY` and sends `Authorization: Bearer <key>` directly to `easybits.cloud`. There is NO host-pattern interception via OneCLI on this path. If you want OneCLI-managed rotation, store the secret in OneCLI vault as well (instructions below) and set `.env`'s `EASYBITS_API_KEY` from it.
+
+**Toolsets:** Default is `core,design,websites,forms` (~70+ tools server-side). Override via `EASYBITS_TOOLSETS=core,design,webhooks` in the host `.env` to enable webhooks instead, etc. `container/src/container-runner.ts` passes `EASYBITS_TOOLSETS` through to the container.
 
 ### 2.2 Allow the tool glob
 

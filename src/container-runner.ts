@@ -517,6 +517,7 @@ async function buildContainerArgs(
   const passthroughEnv = readEnvFile([
     'BRIGHTDATA_API_TOKEN',
     'EASYBITS_API_KEY',
+    'EASYBITS_TOOLSETS',
     'NANOCLAW_ADMIN_TOKEN',
     'GHOSTY_STUDIO_API_BASE',
     'DEEPSEEK_API_KEY',

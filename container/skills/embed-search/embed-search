@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 INDEX_FILE_NAME = ".embed-index.json"
-MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-d, ~120MB, multilingual
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # 384-d, ~220MB, ~50 langs
 CHUNK_SIZE = 600       # chars per chunk
 CHUNK_OVERLAP = 100
 EXTS = {".md", ".txt", ".markdown"}
@@ -94,8 +94,7 @@ def build_or_update_index(root: Path, model, rebuild: bool):
             chunks = chunk_text(text)
             if not chunks:
                 continue
-            # e5 expects "passage: " prefix for documents
-            embs = list(model.embed([f"passage: {c}" for c in chunks]))
+            embs = list(model.embed(chunks))
             chunk_idxs = []
             for chunk, emb in zip(chunks, embs):
                 idx = len(new_index["chunks"])
@@ -150,7 +149,7 @@ def main():
     if not index["chunks"]:
         sys.exit(f"ERROR: no .md/.txt files indexed under {root}")
 
-    query_emb = list(model.embed([f"query: {args.query}"]))[0]
+    query_emb = list(model.embed([args.query]))[0]
     hits = cosine_search(query_emb, index["chunks"], args.top)
 
     results = []

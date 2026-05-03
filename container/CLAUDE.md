@@ -44,7 +44,28 @@ These are wired in every container — you have direct access to them. Do NOT te
 
 ### MCP servers (auto-loaded)
 
-- **`mcp__easybits__*`** — EasyBits cloud file storage and AI tasks (`@easybits.cloud/mcp`). Tools include `list_files`, `upload_file`, `delete_file`, `create_image`, `create_webhook`, `create_website`, etc. Use when the user asks about files, storage, webhooks, or websites in EasyBits. Auth pre-configured via OneCLI proxy at `easybits.cloud`.
+- **`mcp__easybits__*`** — EasyBits cloud platform (`@easybits.cloud/mcp`). 65+ tools across categories. Default toolsets: `core,design,websites,forms` (override per-install via `EASYBITS_TOOLSETS` env on host).
+  - **Files & sharing**: `list_files`, `get_file`, `upload_file`, `search_files`, `create_share_link`, `list_share_links`, `revoke_share_link`
+  - **Image edit**: `optimize_image` (→ WebP/AVIF), `transform_image` (resize/rotate/grayscale)
+  - **Image generation**: `image_generate` — full EasyBits image-gen pipeline (style + brand kit aware)
+  - **Video / avatar**: `video_create`, `avatar_video_create` (image+audio → talking head), `list_videos`
+  - **Voice TTS**: `voice_tts_create` (EasyBits TTS, distinct from local ElevenLabs `text-to-speech`)
+  - **Documents/Design**: `create_document`, `add_page`, `set_page_html`, `apply_brand_kit`, `pdf_to_images`, `get_document_pdf`, `enhance_document_prompt`, `regenerate_document_page`, `fill_template`, `clone_document`, `deploy_document`, `change_document_format`, etc. (~26 tools)
+  - **Brand Kits**: list/get/create/update/delete + `extract_brand_kit_from_url`
+  - **Characters** (persistent identity memory): `character_remember`, `character_list`, `character_delete`
+  - **Websites & forms**: `create_website`, `upload_website_file`, `deploy_website_file`, `inject_html`, `create_form`, `list_form_submissions`
+  - **Database**: `db_list`, `db_create`, `db_query` — small built-in KV/relational store per account
+  - **Research**: `research_search`, `research_scrape`
+  - **Account**: `get_usage_stats`
+
+  **Priority vs native skills (use the native skill, not EasyBits, for these):**
+  - Image generation → prefer `generate-preview` (gpt-image-1) for general images, `generate-logo` (Recraft) for vector logos. Use `image_generate` (EasyBits) only when the user is *already* working inside an EasyBits brand kit / document workflow.
+  - TTS → prefer `text-to-speech` (ElevenLabs MX voices, sounds better, ships voice notes). Use `voice_tts_create` only inside a multi-step EasyBits workflow that needs the audio asset stored in EasyBits.
+  - Web scraping → prefer `mcp__brightdata__*`. `research_scrape` is fine for quick one-offs.
+  - PDF text extraction → use `pdftotext` first (free, fast). `get_document_pdf` ONLY for downloading existing EasyBits documents — see warning below.
+  - Brand vectorization → prefer `vectorize-image` (Recraft, $0.01). Use `extract_brand_kit_from_url` when the user wants the *whole brand* extracted (logo + colors + fonts) for a new EasyBits brand kit.
+
+  **⚠️ `get_document_pdf` known issue**: returns the full PDF binary in the MCP response. Documents larger than ~30MB or 50+ pages have caused the container to be killed (SIGKILL/137) twice in production. For large docs, use `pdf_to_images` to get individual page images instead, then process incrementally. Auth pre-configured via host env (`EASYBITS_API_KEY`).
 - **`mcp__brightdata__*`** — Bright Data web scraping and extraction (`@brightdata/mcp`). Use for live web scraping, search, structured extraction, or browser automation when WebFetch/WebSearch isn't enough (anti-bot pages, JavaScript-rendered content, geo-blocked content, large-scale scraping). Auth pre-configured via OneCLI proxy at `brightdata.com`.
 
 ### Container skills (Bash scripts, in PATH)
