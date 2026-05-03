@@ -190,7 +190,9 @@ function previewContent(raw: string): string {
   try {
     const parsed = JSON.parse(raw) as { text?: string };
     if (typeof parsed.text === 'string') return parsed.text.slice(0, 500);
-  } catch { /* fall through */ }
+  } catch {
+    /* fall through */
+  }
   return raw.slice(0, 500);
 }
 
@@ -214,7 +216,11 @@ interface InboundContent {
  */
 function resolveInboundSenderName(raw: string, channelType: string | null): string {
   let parsed: InboundContent = {};
-  try { parsed = JSON.parse(raw) as InboundContent; } catch { /* */ }
+  try {
+    parsed = JSON.parse(raw) as InboundContent;
+  } catch {
+    /* */
+  }
 
   const realName = parsed.author?.fullName || parsed.author?.userName;
   if (realName) return realName;
@@ -229,7 +235,9 @@ function resolveInboundSenderName(raw: string, channelType: string | null): stri
       try {
         const user = getUser(userId);
         if (user?.display_name) return user.display_name;
-      } catch { /* DB issue — fall through to pretty-print */ }
+      } catch {
+        /* DB issue — fall through to pretty-print */
+      }
     }
     return prettyJid(c);
   }
@@ -303,9 +311,11 @@ function activityFor(agentGroupId: string, mgId: string, channelType: string | n
       if (fs.existsSync(inPath)) {
         const inDb = new Database(inPath, { readonly: true });
         try {
-          const inRows = inDb.prepare(
-            "SELECT id, content, timestamp FROM messages_in WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
-          ).all() as Array<{ id: string; content: string; timestamp: string }>;
+          const inRows = inDb
+            .prepare(
+              "SELECT id, content, timestamp FROM messages_in WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
+            )
+            .all() as Array<{ id: string; content: string; timestamp: string }>;
           for (const r of inRows) {
             const iso = normalizeTimestamp(r.timestamp) ?? r.timestamp;
             const tsMs = Date.parse(iso);
@@ -331,9 +341,11 @@ function activityFor(agentGroupId: string, mgId: string, channelType: string | n
       if (fs.existsSync(outPath)) {
         const outDb = new Database(outPath, { readonly: true });
         try {
-          const outRows = outDb.prepare(
-            "SELECT id, content, timestamp FROM messages_out WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
-          ).all() as Array<{ id: string; content: string; timestamp: string }>;
+          const outRows = outDb
+            .prepare(
+              "SELECT id, content, timestamp FROM messages_out WHERE kind IN ('chat','chat-sdk') ORDER BY timestamp DESC LIMIT 100",
+            )
+            .all() as Array<{ id: string; content: string; timestamp: string }>;
           for (const r of outRows) {
             const iso = normalizeTimestamp(r.timestamp) ?? r.timestamp;
             const tsMs = Date.parse(iso);
@@ -381,9 +393,11 @@ function activityFor(agentGroupId: string, mgId: string, channelType: string | n
 // ── Container logs ────────────────────────────────────────────────────────
 
 function tailContainerLogs(agentGroupId: string, lines: number): string {
-  const ps = spawnSync(CONTAINER_RUNTIME_BIN, [
-    'ps', '--filter', `label=nanoclaw-agent-group-id=${agentGroupId}`, '--format', '{{.Names}}',
-  ], { encoding: 'utf8' });
+  const ps = spawnSync(
+    CONTAINER_RUNTIME_BIN,
+    ['ps', '--filter', `label=nanoclaw-agent-group-id=${agentGroupId}`, '--format', '{{.Names}}'],
+    { encoding: 'utf8' },
+  );
   if (ps.status !== 0) return '';
   const name = (ps.stdout || '').trim().split('\n')[0];
   if (!name) return '';
@@ -497,7 +511,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
         agent_group_id: typeof body.agent_group_id === 'string' ? body.agent_group_id : undefined,
         engage_mode: body.engage_mode as Parameters<typeof createGroupCore>[0]['engage_mode'],
         engage_pattern: body.engage_pattern as string | null | undefined,
-        unknown_sender_policy: body.unknown_sender_policy as Parameters<typeof createGroupCore>[0]['unknown_sender_policy'],
+        unknown_sender_policy: body.unknown_sender_policy as Parameters<
+          typeof createGroupCore
+        >[0]['unknown_sender_policy'],
         assistant_name: typeof body.assistant_name === 'string' ? body.assistant_name : undefined,
       },
       actorUserId,
@@ -530,13 +546,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
 
   // GET /admin/agents
   if (method === 'GET' && parts[0] === 'admin' && parts[1] === 'agents' && parts.length === 2) {
-    const rows = getDb().prepare(`
+    const rows = getDb()
+      .prepare(
+        `
       SELECT mg.platform_id AS jid
         FROM messaging_groups mg
         JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
        GROUP BY mg.id
        ORDER BY mg.created_at
-    `).all() as Array<{ jid: string }>;
+    `,
+      )
+      .all() as Array<{ jid: string }>;
     const out: DropletAgent[] = [];
     for (const { jid } of rows) {
       const resolved = resolveJid(jid);
@@ -645,7 +665,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
       // requiresTrigger → MGA.engage_mode (mention | pattern)
       if (typeof body.requiresTrigger === 'boolean') {
         if (body.requiresTrigger) {
-          getDb().prepare("UPDATE messaging_group_agents SET engage_mode = 'mention' WHERE id = ?").run(resolved.mga.id);
+          getDb()
+            .prepare("UPDATE messaging_group_agents SET engage_mode = 'mention' WHERE id = ?")
+            .run(resolved.mga.id);
         } else {
           getDb()
             .prepare("UPDATE messaging_group_agents SET engage_mode = 'pattern', engage_pattern = '.' WHERE id = ?")
@@ -673,16 +695,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
       // are read by the host on every message — no restart needed.
       let restartedContainer = false;
       if (touchedFiles) {
-        const ps = spawnSync(CONTAINER_RUNTIME_BIN, [
-          'ps', '--filter', `label=nanoclaw-agent-group-id=${resolved.agentGroup.id}`, '--format', '{{.Names}}',
-        ], { encoding: 'utf8' });
+        const ps = spawnSync(
+          CONTAINER_RUNTIME_BIN,
+          ['ps', '--filter', `label=nanoclaw-agent-group-id=${resolved.agentGroup.id}`, '--format', '{{.Names}}'],
+          { encoding: 'utf8' },
+        );
         const name = (ps.stdout || '').trim().split('\n').filter(Boolean)[0];
         if (name) {
           try {
             stopContainer(name);
             restartedContainer = true;
           } catch (e) {
-            log.warn('Admin PATCH: failed to stop container', { name, err: e instanceof Error ? e.message : String(e) });
+            log.warn('Admin PATCH: failed to stop container', {
+              name,
+              err: e instanceof Error ? e.message : String(e),
+            });
           }
         }
       }
@@ -691,7 +718,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
       const fresh = resolveJid(jid);
       const container = fresh ? readContainerConfig(fresh.agentGroup.folder) : null;
       const detail: DropletAgentDetail | null = fresh
-        ? { ...publicAgent(jid, fresh, container), containerConfig: container, claudeMd: readClaudeMd(fresh.agentGroup.folder) }
+        ? {
+            ...publicAgent(jid, fresh, container),
+            containerConfig: container,
+            claudeMd: readClaudeMd(fresh.agentGroup.folder),
+          }
         : null;
 
       send(res, 200, {
@@ -734,7 +765,9 @@ export function startAdminServer(): void {
       log.error('Admin handler threw', { url: req.url, err });
       try {
         send(res, 500, { error: 'internal' });
-      } catch { /* response already sent */ }
+      } catch {
+        /* response already sent */
+      }
     });
   });
 

@@ -222,7 +222,7 @@ export async function applyRegisterChannel(
   if (!privileged) {
     notifyAgent(
       session,
-      `register_channel rejected: you must be owner or admin of the target agent group. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+      `register_channel rejected: you must be owner or admin of the target agent group. Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'unknown')}.`,
     );
     return;
   }
@@ -249,9 +249,7 @@ export async function applyRegisterChannel(
   // this, re-registering an already-wired channel throws UNIQUE constraint
   // and the user's "change my engage to X" intent silently fails.
   const session_mode = isolationToSessionMode(isolation);
-  const existingWiring = getMessagingGroupAgents(mg.id).find(
-    (m) => m.agent_group_id === targetAgentGroupId,
-  );
+  const existingWiring = getMessagingGroupAgents(mg.id).find((m) => m.agent_group_id === targetAgentGroupId);
   let action: 'created' | 'updated';
   if (existingWiring) {
     updateMessagingGroupAgent(existingWiring.id, {
@@ -367,20 +365,19 @@ export async function applyListDiscoveredGroups(
 
   // Flag which ones are already wired so the agent doesn't try to re-register.
   const wiredSet = new Set(
-    (getDb()
-      .prepare(
-        `SELECT mg.channel_type || '|' || mg.platform_id AS key
+    (
+      getDb()
+        .prepare(
+          `SELECT mg.channel_type || '|' || mg.platform_id AS key
            FROM messaging_groups mg
            JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id`,
-      )
-      .all() as Array<{ key: string }>).map((r) => r.key),
+        )
+        .all() as Array<{ key: string }>
+    ).map((r) => r.key),
   );
 
   if (rows.length === 0) {
-    notifyAgent(
-      session,
-      'Discovered channels: none yet. The adapter needs to see traffic / sync metadata first.',
-    );
+    notifyAgent(session, 'Discovered channels: none yet. The adapter needs to see traffic / sync metadata first.');
     return;
   }
 
@@ -452,12 +449,9 @@ export async function createGroupCore(
   }
 
   const engage_mode: EngageMode = input.engage_mode ?? 'pattern';
-  const rawPattern =
-    input.engage_pattern ??
-    (engage_mode === 'pattern' ? `\\b${ASSISTANT_NAME}\\b` : null);
+  const rawPattern = input.engage_pattern ?? (engage_mode === 'pattern' ? `\\b${ASSISTANT_NAME}\\b` : null);
   const engage_pattern = sanitizeEnginePattern(rawPattern);
-  const unknown_sender_policy: UnknownSenderPolicy =
-    input.unknown_sender_policy ?? 'request_approval';
+  const unknown_sender_policy: UnknownSenderPolicy = input.unknown_sender_policy ?? 'request_approval';
   const assistant_name = input.assistant_name || ASSISTANT_NAME;
 
   // Resolve target agent group before touching the platform.
@@ -506,7 +500,7 @@ export async function createGroupCore(
   if (!privileged) {
     return {
       ok: false,
-      error: `you must be owner or admin of the target agent group. Current role for ${requestingUserId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+      error: `you must be owner or admin of the target agent group. Current role for ${requestingUserId}: ${access.allowed ? access.reason : (access.reason ?? 'unknown')}.`,
     };
   }
 
@@ -605,10 +599,7 @@ export async function applyCreateGroup(
 ): Promise<void> {
   const userId = getLastInboundUserId(inDb);
   if (!userId) {
-    notifyAgent(
-      session,
-      'create_group rejected: could not resolve the calling user from the current session.',
-    );
+    notifyAgent(session, 'create_group rejected: could not resolve the calling user from the current session.');
     return;
   }
 
@@ -618,8 +609,8 @@ export async function applyCreateGroup(
   const explicitAgentGroupId = content.agent_group_id as string | undefined;
   const effectiveAgentGroupId =
     isolation === 'separate-agent'
-      ? explicitAgentGroupId ?? session.agent_group_id
-      : explicitAgentGroupId ?? session.agent_group_id;
+      ? (explicitAgentGroupId ?? session.agent_group_id)
+      : (explicitAgentGroupId ?? session.agent_group_id);
 
   const result = await createGroupCore(
     {
@@ -669,7 +660,10 @@ export async function applyGetInviteLink(
     return;
   }
   if (!adapter.isConnected()) {
-    notifyAgent(session, 'get_invite_link failed: WhatsApp adapter is not connected. Ask the user to retry in a moment.');
+    notifyAgent(
+      session,
+      'get_invite_link failed: WhatsApp adapter is not connected. Ask the user to retry in a moment.',
+    );
     return;
   }
   let link: string | null = null;
@@ -725,7 +719,7 @@ export async function applyLeaveGroup(
   if (!privileged) {
     notifyAgent(
       session,
-      `leave_group rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+      `leave_group rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'unknown')}.`,
     );
     return;
   }
@@ -793,31 +787,39 @@ export async function applyUpdateChannelPolicy(
     return;
   }
   if (!['strict', 'request_approval', 'public'].includes(policy)) {
-    notifyAgent(session, `update_channel_policy rejected: unknown_sender_policy must be one of "strict" | "request_approval" | "public" (got "${policy}").`);
+    notifyAgent(
+      session,
+      `update_channel_policy rejected: unknown_sender_policy must be one of "strict" | "request_approval" | "public" (got "${policy}").`,
+    );
     return;
   }
 
   const userId = getLastInboundUserId(inDb);
   if (!userId) {
-    notifyAgent(session, 'update_channel_policy rejected: could not resolve the calling user from the current session.');
+    notifyAgent(
+      session,
+      'update_channel_policy rejected: could not resolve the calling user from the current session.',
+    );
     return;
   }
 
   const channelType = (content.channel_type as string | undefined) || 'whatsapp';
   const mg = getMessagingGroupByPlatform(channelType, platformId);
   if (!mg) {
-    notifyAgent(session, `update_channel_policy rejected: no messaging_group found for ${channelType}:${platformId}. Use register_channel first.`);
+    notifyAgent(
+      session,
+      `update_channel_policy rejected: no messaging_group found for ${channelType}:${platformId}. Use register_channel first.`,
+    );
     return;
   }
 
-  const targetAgentGroupId =
-    getMessagingGroupAgents(mg.id)[0]?.agent_group_id ?? session.agent_group_id;
+  const targetAgentGroupId = getMessagingGroupAgents(mg.id)[0]?.agent_group_id ?? session.agent_group_id;
   const access = canAccessAgentGroup(userId, targetAgentGroupId);
   const privileged = access.allowed && ['owner', 'global_admin', 'admin_of_group'].includes(access.reason);
   if (!privileged) {
     notifyAgent(
       session,
-      `update_channel_policy rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+      `update_channel_policy rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'unknown')}.`,
     );
     return;
   }
@@ -826,10 +828,7 @@ export async function applyUpdateChannelPolicy(
     updateMessagingGroup(mg.id, { unknown_sender_policy: policy as 'strict' | 'request_approval' | 'public' });
     log.info('update_channel_policy applied', { mgId: mg.id, platformId, policy });
   } catch (err) {
-    notifyAgent(
-      session,
-      `update_channel_policy failed: ${err instanceof Error ? err.message : String(err)}.`,
-    );
+    notifyAgent(session, `update_channel_policy failed: ${err instanceof Error ? err.message : String(err)}.`);
     return;
   }
 
@@ -866,7 +865,7 @@ export async function applyRenameGroup(
   if (!privileged) {
     notifyAgent(
       session,
-      `rename_group rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+      `rename_group rejected: requires owner or admin privileges. Current role for ${userId}: ${access.allowed ? access.reason : (access.reason ?? 'unknown')}.`,
     );
     return;
   }
@@ -966,7 +965,7 @@ export async function applyMigrateToSeparateAgent(
   if (!allowed) {
     notifyAgent(
       session,
-      `migrate_to_separate_agent rejected: requires global owner or admin. Your role for this agent group: ${access.allowed ? access.reason : access.reason ?? 'none'}.`,
+      `migrate_to_separate_agent rejected: requires global owner or admin. Your role for this agent group: ${access.allowed ? access.reason : (access.reason ?? 'none')}.`,
     );
     return;
   }

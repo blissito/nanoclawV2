@@ -337,9 +337,7 @@ function enforceRunningContainerSla(
 
 function lastOutboundTimestampMs(outDb: Database.Database): number {
   try {
-    const row = outDb
-      .prepare('SELECT MAX(timestamp) AS t FROM messages_out')
-      .get() as { t: string | null } | undefined;
+    const row = outDb.prepare('SELECT MAX(timestamp) AS t FROM messages_out').get() as { t: string | null } | undefined;
     if (!row?.t) return 0;
     const ms = Date.parse(row.t);
     return Number.isNaN(ms) ? 0 : ms;
@@ -370,12 +368,7 @@ function clearSdkSessionId(_outDb: Database.Database, agentGroupId: string, sess
 // next inbound). delivery.ts picks this up on its next poll. Best-effort:
 // failures are logged and don't block the kill path. Called only post-kill
 // when the container is dead → no single-writer-invariant race.
-function announceContainerCrash(
-  inDb: Database.Database,
-  session: Session,
-  agentGroupId: string,
-  reason: string,
-): void {
+function announceContainerCrash(inDb: Database.Database, session: Session, agentGroupId: string, reason: string): void {
   if (!session.messaging_group_id) {
     log.warn('Cannot announce crash — session has no messaging_group_id', { sessionId: session.id });
     return;
@@ -397,7 +390,8 @@ function announceContainerCrash(
     const nextSeq = max % 2 === 0 ? max + 2 : max + 1;
 
     const id = `crash-announce-${session.id}-${Date.now()}`;
-    const text = '🔄 Se me colgó el turno (timeout del SDK). Ya volví — si tu último mensaje no recibió respuesta, mándamelo de nuevo.';
+    const text =
+      '🔄 Se me colgó el turno (timeout del SDK). Ya volví — si tu último mensaje no recibió respuesta, mándamelo de nuevo.';
     writer
       .prepare(
         `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
@@ -421,9 +415,9 @@ function resetStuckProcessingRows(
 ): void {
   const claims = getProcessingClaims(outDb);
   const completedCount = (
-    outDb
-      .prepare("SELECT COUNT(*) as c FROM processing_ack WHERE status IN ('completed', 'failed')")
-      .get() as { c: number }
+    outDb.prepare("SELECT COUNT(*) as c FROM processing_ack WHERE status IN ('completed', 'failed')").get() as {
+      c: number;
+    }
   ).c;
 
   if (claims.length === 0 && completedCount === 0) return;
@@ -498,9 +492,7 @@ function resetStuckProcessingRows(
     // outDb is readonly there. Without this, processing_ack grows unbounded
     // (prod incident: 311 'completed' rows accumulated over 4 days).
     if (completedCount > 0) {
-      const reaped = outWriter
-        .prepare("DELETE FROM processing_ack WHERE status IN ('completed', 'failed')")
-        .run();
+      const reaped = outWriter.prepare("DELETE FROM processing_ack WHERE status IN ('completed', 'failed')").run();
       if (reaped.changes > 0) {
         log.info('Reaped completed processing_ack rows', {
           sessionId: session.id,

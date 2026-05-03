@@ -464,9 +464,7 @@ async function deliverToAgent(
     if (adapter?.reactToMessage) {
       void adapter
         .reactToMessage(event.platformId, event.message.id, '\u{1F440}')
-        .catch((err) =>
-          log.debug('reactToMessage failed', { channelType: event.channelType, err }),
-        );
+        .catch((err) => log.debug('reactToMessage failed', { channelType: event.channelType, err }));
       markPending(event.platformId, event.message.id);
     }
 

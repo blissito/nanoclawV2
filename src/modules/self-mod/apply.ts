@@ -233,11 +233,17 @@ export async function applyResetAgent(
   if (reqName) {
     const dest = getDestinationByName(session.agent_group_id, normalizeName(reqName));
     if (!dest) {
-      notifyAgent(session, `reset_agent rejected: no destination named "${reqName}" in your address book. List your sub-agents to see valid names.`);
+      notifyAgent(
+        session,
+        `reset_agent rejected: no destination named "${reqName}" in your address book. List your sub-agents to see valid names.`,
+      );
       return;
     }
     if (dest.target_type !== 'agent') {
-      notifyAgent(session, `reset_agent rejected: destination "${reqName}" is a channel, not a sub-agent. Reset is only for sub-agents created via create_agent.`);
+      notifyAgent(
+        session,
+        `reset_agent rejected: destination "${reqName}" is a channel, not a sub-agent. Reset is only for sub-agents created via create_agent.`,
+      );
       return;
     }
     targetAgentGroupId = dest.target_id;
@@ -251,7 +257,10 @@ export async function applyResetAgent(
   // Refuse self-reset — reset is for sub-agents only. Use restart_container
   // for own-container restart.
   if (targetAgentGroupId === session.agent_group_id) {
-    notifyAgent(session, 'reset_agent rejected: cannot reset your own agent group. Reset is for sub-agents. Use restart_container to restart your own container.');
+    notifyAgent(
+      session,
+      'reset_agent rejected: cannot reset your own agent group. Reset is for sub-agents. Use restart_container to restart your own container.',
+    );
     return;
   }
 

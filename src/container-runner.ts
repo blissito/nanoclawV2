@@ -181,9 +181,9 @@ async function spawnContainer(session: Session): Promise<void> {
     };
     try {
       const db = new Database(outboundDbPath(agentGroup.id, session.id), { readonly: true });
-      const row = db
-        .prepare('SELECT current_tool, tool_started_at FROM container_state WHERE id = 1')
-        .get() as { current_tool: string | null; tool_started_at: string | null } | undefined;
+      const row = db.prepare('SELECT current_tool, tool_started_at FROM container_state WHERE id = 1').get() as
+        | { current_tool: string | null; tool_started_at: string | null }
+        | undefined;
       db.close();
       if (row?.current_tool) {
         postmortem = {
@@ -495,9 +495,14 @@ async function buildContainerArgs(
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = [
-    'run', '--rm', '--name', containerName,
-    '--label', CONTAINER_INSTALL_LABEL,
-    '--label', `nanoclaw-agent-group-id=${agentGroup.id}`,
+    'run',
+    '--rm',
+    '--name',
+    containerName,
+    '--label',
+    CONTAINER_INSTALL_LABEL,
+    '--label',
+    `nanoclaw-agent-group-id=${agentGroup.id}`,
   ];
 
   // Environment — only vars read by code we don't own.
@@ -567,7 +572,8 @@ async function buildContainerArgs(
   // (from /api/oauth/google/access-token) is what authenticates these
   // requests, so we want them to skip the proxy entirely. Same pattern as
   // BrightData's NO_PROXY in mcp-tools/index.ts.
-  const googleMcpHosts = 'gmailmcp.googleapis.com,drivemcp.googleapis.com,calendarmcp.googleapis.com,api.deepseek.com,127.0.0.1,localhost,queue.fal.run,fal.run,fal.media,v3.fal.media,api.openai.com';
+  const googleMcpHosts =
+    'gmailmcp.googleapis.com,drivemcp.googleapis.com,calendarmcp.googleapis.com,api.deepseek.com,127.0.0.1,localhost,queue.fal.run,fal.run,fal.media,v3.fal.media,api.openai.com';
   args.push('-e', `NO_PROXY=${googleMcpHosts}`);
   args.push('-e', `no_proxy=${googleMcpHosts}`);
 

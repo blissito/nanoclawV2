@@ -386,9 +386,7 @@ async function deliverMessage(
       for (const inboundId of pending) {
         void deliveryAdapter
           .reactToMessage(msg.channel_type, msg.platform_id, inboundId, '\u{2705}')
-          .catch((err) =>
-            log.debug('done-reaction failed', { channelType: msg.channel_type, err }),
-          );
+          .catch((err) => log.debug('done-reaction failed', { channelType: msg.channel_type, err }));
       }
     }
   }

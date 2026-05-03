@@ -33,9 +33,7 @@ export function listDiscoveredChannels(channelType?: string): DiscoveredChannel[
   const db = getDb();
   if (channelType) {
     return db
-      .prepare(
-        `SELECT * FROM discovered_channels WHERE channel_type = ? ORDER BY last_seen DESC`,
-      )
+      .prepare(`SELECT * FROM discovered_channels WHERE channel_type = ? ORDER BY last_seen DESC`)
       .all(channelType) as DiscoveredChannel[];
   }
   return db
