@@ -106,21 +106,24 @@ ENV U2NET_HOME=/home/node/.u2net
 # PyTorch / paddlepaddle / transformers (~2GB combined) and use ONNX-only
 # packages — adds ~200MB to the image.
 #
-#   - opencv-python-headless: image IO for rapidocr (pre-installed FIRST so
-#     pip won't pull opencv-python full ~190MB with X11/GTK/Qt bindings we
-#     don't use in a headless container).
 #   - rapidocr-onnxruntime: PaddleOCR det+rec models exported to ONNX,
-#     bundled inside the wheel (no separate download).
+#     bundled inside the wheel (no separate download). Pulls opencv-python
+#     (~190MB full, with X11/GTK/Qt) as a transitive dep — we then uninstall
+#     it and install opencv-python-headless instead. cv2 is a shared
+#     namespace so rapidocr still works; we just save the GUI bindings we
+#     don't use in a headless container.
 #   - fastembed: minimal embeddings runtime; pre-fetch the multilingual MiniLM
 #     model (~220MB, 384-d, ~50 langs incl. Spanish) at build so the first
 #     agent call doesn't block on a download. (e5-small isn't supported in
 #     fastembed 0.8 — only e5-large at 2.24GB; MiniLM is the lighter pick.)
 RUN pip3 install --break-system-packages --no-cache-dir \
-        opencv-python-headless \
         rapidocr-onnxruntime \
         fastembed \
+    && pip3 uninstall --break-system-packages -y opencv-python \
+    && pip3 install --break-system-packages --no-cache-dir opencv-python-headless \
     && mkdir -p /home/node/.fastembed \
     && python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir='/home/node/.fastembed')" \
+    && python3 -c "import cv2; print('cv2 still importable from headless:', cv2.__version__)" \
     && chown -R node:node /home/node/.fastembed
 
 # ---- Bun runtime -------------------------------------------------------------
