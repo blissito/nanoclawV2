@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# vectorize-image <path>
+# Converts a raster image (PNG/JPG/WebP) to clean SVG via Recraft on fal.ai.
+
+set -euo pipefail
+
+INPUT="${1:?usage: vectorize-image <input-path>}"
+[[ -f "$INPUT" ]] || { echo "ERROR: not a file: $INPUT" >&2; exit 1; }
+[[ -n "${FAL_KEY:-}" ]] || { echo "ERROR: FAL_KEY not set in container env" >&2; exit 1; }
+
+OUTPUT_DIR="/workspace/agent"
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_FILE="${OUTPUT_DIR}/vectorized-$(date +%s%3N).svg"
+
+MIME=$(file -b --mime-type "$INPUT")
+case "$MIME" in
+  image/png|image/jpeg|image/webp) ;;
+  *) echo "ERROR: unsupported mime $MIME (need PNG/JPG/WebP)" >&2; exit 1 ;;
+esac
+
+# Encode as data URI inline. Works for typical logos < 2MB.
+DATA_URI="data:${MIME};base64,$(base64 -w 0 "$INPUT")"
+
+PAYLOAD=$(python3 -c 'import json,sys; print(json.dumps({"image_url": sys.argv[1]}))' "$DATA_URI")
+
+RESPONSE=$(curl -fsS -X POST "https://fal.run/fal-ai/recraft/vectorize" \
+  -H "Authorization: Key $FAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+URL=$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+img = d.get("image") or {}
+if img.get("url"):
+    print(img["url"]); raise SystemExit
+imgs = d.get("images") or []
+if imgs and isinstance(imgs, list) and imgs[0].get("url"):
+    print(imgs[0]["url"]); raise SystemExit
+print("")
+' <<<"$RESPONSE")
+
+if [[ -z "$URL" ]]; then
+  echo "ERROR: no SVG URL in fal response: $RESPONSE" >&2
+  exit 1
+fi
+
+curl -fsS -o "$OUTPUT_FILE" "$URL"
+echo "$OUTPUT_FILE"

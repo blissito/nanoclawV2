@@ -37,6 +37,9 @@ import { getSessionsByAgentGroup } from './db/sessions.js';
 import { inboundDbPath, outboundDbPath } from './session-manager.js';
 import { CONTAINER_RUNTIME_BIN, stopContainer } from './container-runtime.js';
 import { getUser } from './modules/permissions/db/users.js';
+import { getOwners } from './modules/permissions/db/user-roles.js';
+import { getChannelAdapter } from './channels/channel-registry.js';
+import { createGroupCore } from './modules/channels/apply.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
 const DEFAULT_PORT = 8787;
@@ -443,6 +446,88 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
   const method = req.method ?? 'GET';
   const parts = url.pathname.split('/').filter(Boolean);
 
+  // POST /admin/agents — create a new WhatsApp group, persist wiring, return jid + invite link.
+  // Body: { name: string, isolation?, folder?, agent_group_id?, engage_mode?, engage_pattern?,
+  //         unknown_sender_policy?, assistant_name?, actor_user_id? }
+  // Defaults to isolation="separate-agent" with folder derived from name (slugify).
+  if (method === 'POST' && parts[0] === 'admin' && parts[1] === 'agents' && parts.length === 2) {
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      send(res, 400, { error: 'invalid_json' });
+      return;
+    }
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) {
+      send(res, 400, { error: 'name_required' });
+      return;
+    }
+
+    // Resolve actor user. Body override > first global owner.
+    let actorUserId = typeof body.actor_user_id === 'string' ? body.actor_user_id : '';
+    if (!actorUserId) {
+      const owners = getOwners();
+      if (owners.length === 0) {
+        send(res, 503, { error: 'no_global_owner_configured' });
+        return;
+      }
+      actorUserId = owners[0].user_id;
+    }
+
+    // Default folder: slugify(name) when isolation=separate-agent (most common HTTP path).
+    const isolation = (body.isolation as string | undefined) ?? 'separate-agent';
+    let folder = typeof body.folder === 'string' ? body.folder.trim() : '';
+    if (isolation === 'separate-agent' && !folder) {
+      folder =
+        `whatsapp_${name
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[̀-ͯ]/g, '')
+          .replace(/[^a-z0-9]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .slice(0, 40)}` || `whatsapp_group_${Date.now()}`;
+    }
+
+    const result = await createGroupCore(
+      {
+        name,
+        isolation: isolation as Parameters<typeof createGroupCore>[0]['isolation'],
+        folder: folder || undefined,
+        agent_group_id: typeof body.agent_group_id === 'string' ? body.agent_group_id : undefined,
+        engage_mode: body.engage_mode as Parameters<typeof createGroupCore>[0]['engage_mode'],
+        engage_pattern: body.engage_pattern as string | null | undefined,
+        unknown_sender_policy: body.unknown_sender_policy as Parameters<typeof createGroupCore>[0]['unknown_sender_policy'],
+        assistant_name: typeof body.assistant_name === 'string' ? body.assistant_name : undefined,
+      },
+      actorUserId,
+    );
+
+    if (!result.ok) {
+      send(res, result.partial ? 502 : 400, {
+        error: 'create_group_failed',
+        message: result.error,
+        partial: result.partial,
+      });
+      return;
+    }
+
+    // Build the same shape that GET /admin/agents/:jid returns so ghosty-studio
+    // doesn't need a follow-up fetch.
+    const resolved = resolveJid(result.platformId);
+    const container = resolved ? readContainerConfig(resolved.agentGroup.folder) : null;
+    send(res, 200, {
+      jid: result.platformId,
+      name,
+      agent_group_id: result.agentGroupId,
+      folder: result.folder,
+      invite_link: result.inviteLink,
+      isolation: result.isolation,
+      ...(resolved ? publicAgent(result.platformId, resolved, container) : {}),
+    });
+    return;
+  }
+
   // GET /admin/agents
   if (method === 'GET' && parts[0] === 'admin' && parts[1] === 'agents' && parts.length === 2) {
     const rows = getDb().prepare(`
@@ -487,6 +572,30 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, cfg: 
     // GET /admin/agents/:jid/activity
     if (method === 'GET' && parts.length === 4 && parts[3] === 'activity') {
       send(res, 200, activityFor(resolved.agentGroup.id, resolved.mg.id, resolved.mg.channel_type));
+      return;
+    }
+
+    // GET /admin/agents/:jid/invite-link
+    if (method === 'GET' && parts.length === 4 && parts[3] === 'invite-link') {
+      const adapter = getChannelAdapter('whatsapp');
+      if (!adapter || !adapter.getInviteLink) {
+        send(res, 503, { error: 'whatsapp_adapter_unavailable' });
+        return;
+      }
+      if (!adapter.isConnected()) {
+        send(res, 503, { error: 'whatsapp_adapter_disconnected' });
+        return;
+      }
+      try {
+        const link = await adapter.getInviteLink(jid);
+        send(res, 200, { invite_link: link });
+      } catch (err) {
+        log.warn('getInviteLink failed', { jid, err: err instanceof Error ? err.message : String(err) });
+        send(res, 502, {
+          error: 'invite_link_failed',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
       return;
     }
 

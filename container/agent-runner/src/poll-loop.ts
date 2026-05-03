@@ -316,6 +316,17 @@ async function processQuery(
   // reporting rather than fabricating an idempotency key.
   let lastReportedSeq = currentMaxOutboundSeq();
 
+  // Idle-stream watchdog state: after the SDK emits a `result` event the
+  // async iterator may sit idle indefinitely even though Anthropic has more
+  // messages queued — confirmed by aborts that report "Query completed after
+  // N SDK messages". When that happens with no follow-up push, processQuery
+  // never returns and only the 30-min hard ceiling recovers the container.
+  // Track the last event timestamp; pollHandle aborts the query if we go
+  // IDLE_STREAM_TIMEOUT_MS past a result without progress.
+  let lastEventAt = Date.now();
+  let sawResult = false;
+  const IDLE_STREAM_TIMEOUT_MS = 120_000;
+
   // Periodic in-flight state log so docker logs (dumped on kill) shows what
   // the agent was doing right before it hung. Cheap — fires every 30s while
   // the query is alive.
@@ -353,6 +364,21 @@ async function processQuery(
     if (done) return;
     logInflightState();
 
+    // Idle-stream recovery: if we've already seen a result for this turn but
+    // the SDK has gone silent past IDLE_STREAM_TIMEOUT_MS, abort. The SDK
+    // closes cooperatively (emits its queued events as terminal) and the
+    // for-await exits, returning processQuery to the outer loop. Without
+    // this, only the 30-min absolute ceiling recovers — losing the entire
+    // intervening window and forcing a kill+respawn instead of a clean
+    // close. Bound to post-result so we don't kill turns that legitimately
+    // take >2min on a single tool call.
+    if (sawResult && Date.now() - lastEventAt > IDLE_STREAM_TIMEOUT_MS) {
+      const idleS = Math.round((Date.now() - lastEventAt) / 1000);
+      log(`Idle stream watchdog fired (${idleS}s post-Result without events) — calling query.abort() to recover`);
+      try { query.abort(); } catch { /* */ }
+      return;
+    }
+
     // Restart sentinel takes priority over delivering follow-ups: if a tool
     // armed a restart (OAuth magic link, etc.), don't push new messages into
     // a soon-to-be-stale query — exit and let the host respawn.
@@ -386,6 +412,7 @@ async function processQuery(
     for await (const event of query.events) {
       handleEvent(event, routing);
       touchHeartbeat();
+      lastEventAt = Date.now();
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -403,6 +430,7 @@ async function processQuery(
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
+        sawResult = true;
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);

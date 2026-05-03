@@ -48,12 +48,19 @@ function getMaxMessagesPerPrompt(): number {
  * context (trigger=0) rides along with the wake-eligible rows so the agent
  * sees the prior context it missed. Host's countDueMessages gates waking on
  * trigger=1 separately (see src/db/session-db.ts).
+ *
+ * Anti-starvation: when the most-recent N rows are all trigger=0
+ * (reactions, accumulate-only echoes), the oldest pending trigger=1 is
+ * spliced into the batch (evicting the oldest of the recent window).
+ * Without this, a backlog of trigger=0 rows pushes the only trigger=1 out
+ * of the LIMIT window and the poll-loop accumulate gate skips forever.
  */
 export function getPendingMessages(): MessageInRow[] {
   const inbound = getInboundDb();
   const outbound = getOutboundDb();
+  const limit = getMaxMessagesPerPrompt();
 
-  const pending = inbound
+  const recent = inbound
     .prepare(
       `SELECT * FROM messages_in
        WHERE status = 'pending'
@@ -61,9 +68,26 @@ export function getPendingMessages(): MessageInRow[] {
        ORDER BY seq DESC
        LIMIT ?`,
     )
-    .all(getMaxMessagesPerPrompt()) as MessageInRow[];
+    .all(limit) as MessageInRow[];
 
-  if (pending.length === 0) return [];
+  if (recent.length === 0) return [];
+
+  let combined: MessageInRow[] = recent;
+  if (!recent.some((m) => m.trigger === 1)) {
+    const oldestTrigger = inbound
+      .prepare(
+        `SELECT * FROM messages_in
+         WHERE status = 'pending'
+           AND trigger = 1
+           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+         ORDER BY seq ASC
+         LIMIT 1`,
+      )
+      .get() as MessageInRow | undefined;
+    if (oldestTrigger) {
+      combined = recent.length < limit ? [...recent, oldestTrigger] : [...recent.slice(0, -1), oldestTrigger];
+    }
+  }
 
   // Filter out messages already acknowledged in outbound.db
   const ackedIds = new Set(
@@ -72,9 +96,10 @@ export function getPendingMessages(): MessageInRow[] {
     ),
   );
 
-  // Reverse: we fetched DESC to take the most recent N, but the agent
-  // should see them in chronological order (oldest first).
-  return pending.filter((m) => !ackedIds.has(m.id)).reverse();
+  // Chronological order (oldest first) for the agent.
+  return combined
+    .filter((m) => !ackedIds.has(m.id))
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
 }
 
 /** Mark messages as processing — writes to processing_ack in outbound.db. */

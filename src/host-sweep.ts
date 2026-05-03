@@ -31,6 +31,7 @@ import fs from 'fs';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   countDueMessages,
   getContainerState,
@@ -298,6 +299,11 @@ function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
+    // Same rationale as kill-stalled: post-compaction SDK wedge leaves the
+    // session in a state that replays the hang on resume. See upstream
+    // claude-agent-sdk-typescript#44 + anthropic-sdk-typescript#867.
+    announceContainerCrash(inDb, session, agentGroupId, 'absolute-ceiling');
+    clearSdkSessionId(outDb, agentGroupId, session.id);
     resetStuckProcessingRows(inDb, outDb, session, agentGroupId, 'absolute-ceiling');
     return;
   }
@@ -354,6 +360,53 @@ function clearSdkSessionId(_outDb: Database.Database, agentGroupId: string, sess
     writer.prepare("DELETE FROM session_state WHERE key = 'sdk_session_id'").run();
   } catch (err) {
     log.warn('Failed to clear sdk_session_id', { err });
+  } finally {
+    writer?.close();
+  }
+}
+
+// Writes a chat-kind message_out row to outbound.db so the user gets a
+// visible signal that the agent crashed (instead of silent dead-air until the
+// next inbound). delivery.ts picks this up on its next poll. Best-effort:
+// failures are logged and don't block the kill path. Called only post-kill
+// when the container is dead → no single-writer-invariant race.
+function announceContainerCrash(
+  inDb: Database.Database,
+  session: Session,
+  agentGroupId: string,
+  reason: string,
+): void {
+  if (!session.messaging_group_id) {
+    log.warn('Cannot announce crash — session has no messaging_group_id', { sessionId: session.id });
+    return;
+  }
+  const mg = getMessagingGroup(session.messaging_group_id);
+  if (!mg) {
+    log.warn('Cannot announce crash — messaging group not found', { sessionId: session.id });
+    return;
+  }
+
+  let writer: Database.Database | null = null;
+  try {
+    writer = new Database(outboundDbPath(agentGroupId, session.id));
+    // Next even seq across both DBs. Container uses odd, host uses even —
+    // mirrors the policy enforced by container/agent-runner/src/db/messages-out.ts:54.
+    const maxOut = (writer.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out').get() as { m: number }).m;
+    const maxIn = (inDb.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
+    const max = Math.max(maxOut, maxIn);
+    const nextSeq = max % 2 === 0 ? max + 2 : max + 1;
+
+    const id = `crash-announce-${session.id}-${Date.now()}`;
+    const text = '🔄 Se me colgó el turno (timeout del SDK). Ya volví — si tu último mensaje no recibió respuesta, mándamelo de nuevo.';
+    writer
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+         VALUES (?, ?, datetime('now'), 'chat', ?, ?, ?, ?)`,
+      )
+      .run(id, nextSeq, mg.platform_id, mg.channel_type, session.thread_id, JSON.stringify({ text }));
+    log.info('Announced container crash to user', { sessionId: session.id, reason, seq: nextSeq });
+  } catch (err) {
+    log.error('Failed to announce container crash', { sessionId: session.id, reason, err });
   } finally {
     writer?.close();
   }

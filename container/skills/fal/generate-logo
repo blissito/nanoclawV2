@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# generate-logo "<prompt>" [--pro]
+# Generates an SVG logo via Recraft V4 on fal.ai. Echoes path on stdout.
+
+set -euo pipefail
+
+PROMPT="${1:?usage: generate-logo \"<prompt>\" [--pro]}"
+shift || true
+
+MODEL="recraft/v4/text-to-vector"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pro) MODEL="recraft/v4/pro/text-to-vector"; shift ;;
+    *) echo "generate-logo: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "${FAL_KEY:-}" ]]; then
+  echo "ERROR: FAL_KEY not set in container env" >&2
+  exit 1
+fi
+
+OUTPUT_DIR="/workspace/agent"
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_FILE="${OUTPUT_DIR}/logo-$(date +%s%3N).svg"
+
+PAYLOAD=$(python3 -c 'import json,sys; print(json.dumps({"prompt": sys.argv[1]}))' "$PROMPT")
+
+RESPONSE=$(curl -fsS -X POST "https://fal.run/fal-ai/${MODEL}" \
+  -H "Authorization: Key $FAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+URL=$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+imgs = d.get("images") or []
+if imgs and isinstance(imgs, list) and imgs[0].get("url"):
+    print(imgs[0]["url"]); raise SystemExit
+img = d.get("image") or {}
+if img.get("url"):
+    print(img["url"]); raise SystemExit
+print("")
+' <<<"$RESPONSE")
+
+if [[ -z "$URL" ]]; then
+  echo "ERROR: no SVG URL in fal response: $RESPONSE" >&2
+  exit 1
+fi
+
+curl -fsS -o "$OUTPUT_FILE" "$URL"
+echo "$OUTPUT_FILE"

@@ -397,56 +397,89 @@ export async function applyListDiscoveredGroups(
   );
 }
 
-export async function applyCreateGroup(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
-  const name = (content.name as string | undefined)?.trim();
-  if (!name) {
-    notifyAgent(session, 'create_group rejected: name is required.');
-    return;
-  }
+export type CreateGroupCoreInput = {
+  name: string;
+  isolation?: Isolation;
+  folder?: string;
+  agent_group_id?: string;
+  engage_mode?: EngageMode;
+  engage_pattern?: string | null;
+  unknown_sender_policy?: UnknownSenderPolicy;
+  assistant_name?: string;
+};
 
-  const isolation = (content.isolation as Isolation | undefined) ?? 'separate-session';
-  const folder = content.folder as string | undefined;
+export type CreateGroupCoreResult =
+  | {
+      ok: true;
+      platformId: string;
+      agentGroupId: string;
+      folder: string;
+      inviteLink: string | null;
+      isolation: Isolation;
+      engageMode: EngageMode;
+      engagePattern: string | null;
+      unknownSenderPolicy: UnknownSenderPolicy;
+    }
+  | {
+      ok: false;
+      error: string;
+      partial?: { platformId: string; inviteLink: string | null };
+    };
+
+/**
+ * Pure-side-effects core for create_group, callable from any context (system
+ * action, HTTP admin endpoint, future MCP server). Does NOT depend on Session.
+ * The caller is responsible for translating the result into a user-facing
+ * response (notifyAgent for chat, JSON body for HTTP).
+ */
+export async function createGroupCore(
+  input: CreateGroupCoreInput,
+  requestingUserId: string,
+): Promise<CreateGroupCoreResult> {
+  const name = input.name?.trim();
+  if (!name) return { ok: false, error: 'name is required' };
+
+  const isolation: Isolation = input.isolation ?? 'separate-session';
+  const folder = input.folder;
   if (isolation === 'separate-agent' && !folder) {
-    notifyAgent(session, 'create_group rejected: isolation="separate-agent" requires a folder name.');
-    return;
+    return { ok: false, error: 'isolation="separate-agent" requires a folder name' };
+  }
+  if (isolation !== 'separate-agent' && !input.agent_group_id) {
+    return {
+      ok: false,
+      error: 'agent_group_id is required when isolation is not "separate-agent"',
+    };
   }
 
-  const explicitAgentGroupId = content.agent_group_id as string | undefined;
-  const engage_mode = (content.engage_mode as EngageMode | undefined) ?? 'pattern';
+  const engage_mode: EngageMode = input.engage_mode ?? 'pattern';
   const rawPattern =
-    (content.engage_pattern as string | null | undefined) ??
+    input.engage_pattern ??
     (engage_mode === 'pattern' ? `\\b${ASSISTANT_NAME}\\b` : null);
   const engage_pattern = sanitizeEnginePattern(rawPattern);
-  const unknown_sender_policy =
-    (content.unknown_sender_policy as UnknownSenderPolicy | undefined) ?? 'request_approval';
-  const assistant_name = (content.assistant_name as string | undefined) || ASSISTANT_NAME;
+  const unknown_sender_policy: UnknownSenderPolicy =
+    input.unknown_sender_policy ?? 'request_approval';
+  const assistant_name = input.assistant_name || ASSISTANT_NAME;
 
-  const userId = getLastInboundUserId(inDb);
-  if (!userId) {
-    notifyAgent(session, 'create_group rejected: could not resolve the calling user from the current session.');
-    return;
-  }
-
-  // Resolve target agent group BEFORE creating the WhatsApp group, so we
-  // don't end up with an orphan WA group if privilege fails. Mirror the
-  // logic in applyRegisterChannel to keep behavior consistent.
+  // Resolve target agent group before touching the platform.
   let targetAgentGroupId: string;
   if (isolation === 'separate-agent') {
     const existing = getAgentGroupByFolder(folder!);
     if (existing) {
       targetAgentGroupId = existing.id;
     } else {
-      const selfAccess = canAccessAgentGroup(userId, session.agent_group_id);
-      if (!selfAccess.allowed || !['owner', 'global_admin'].includes(selfAccess.reason)) {
-        notifyAgent(
-          session,
-          `create_group rejected: creating a new agent group requires global owner or admin. Your role (${selfAccess.allowed ? selfAccess.reason : 'none'}) is insufficient.`,
-        );
-        return;
+      // Need owner/global_admin to create a new agent group. Use the
+      // explicit agent_group_id (if provided) as the privilege-check anchor;
+      // otherwise we can't validate against any specific group, so fall back
+      // to checking the requesting user has *some* global role.
+      const anchor = input.agent_group_id;
+      if (anchor) {
+        const selfAccess = canAccessAgentGroup(requestingUserId, anchor);
+        if (!selfAccess.allowed || !['owner', 'global_admin'].includes(selfAccess.reason)) {
+          return {
+            ok: false,
+            error: `creating a new agent group requires global owner or admin. Your role (${selfAccess.allowed ? selfAccess.reason : 'none'}) is insufficient.`,
+          };
+        }
       }
       const newId = generateId('ag');
       const agentGroup = {
@@ -459,44 +492,36 @@ export async function applyCreateGroup(
       createAgentGroup(agentGroup);
       initGroupFilesystem(agentGroup);
       targetAgentGroupId = newId;
-      log.info('Agent group created via create_group', { agentGroupId: newId, folder });
+      log.info('Agent group created via createGroupCore', { agentGroupId: newId, folder });
     }
   } else {
-    targetAgentGroupId = explicitAgentGroupId ?? session.agent_group_id;
+    targetAgentGroupId = input.agent_group_id!;
     if (!getAgentGroup(targetAgentGroupId)) {
-      notifyAgent(session, `create_group rejected: agent_group_id "${targetAgentGroupId}" does not exist.`);
-      return;
+      return { ok: false, error: `agent_group_id "${targetAgentGroupId}" does not exist` };
     }
   }
 
-  const access = canAccessAgentGroup(userId, targetAgentGroupId);
+  const access = canAccessAgentGroup(requestingUserId, targetAgentGroupId);
   const privileged = access.allowed && ['owner', 'global_admin', 'admin_of_group'].includes(access.reason);
   if (!privileged) {
-    notifyAgent(
-      session,
-      `create_group rejected: you must be owner or admin of the target agent group. Current role for ${userId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
-    );
-    return;
+    return {
+      ok: false,
+      error: `you must be owner or admin of the target agent group. Current role for ${requestingUserId}: ${access.allowed ? access.reason : access.reason ?? 'unknown'}.`,
+    };
   }
 
-  // Find the WhatsApp adapter (only WA implements createGroup today).
   const adapter = getChannelAdapter('whatsapp');
   if (!adapter || !adapter.createGroup) {
-    notifyAgent(
-      session,
-      'create_group failed: no WhatsApp adapter is loaded that supports createGroup. Tell the user this install does not have group creation wired in yet.',
-    );
-    return;
+    return {
+      ok: false,
+      error: 'no WhatsApp adapter is loaded that supports createGroup',
+    };
   }
   if (!adapter.isConnected()) {
-    notifyAgent(
-      session,
-      'create_group failed: the WhatsApp adapter is not connected right now. The bot needs an active WhatsApp session before it can create groups. Ask the user to wait a moment and retry.',
-    );
-    return;
+    return { ok: false, error: 'WhatsApp adapter is not connected' };
   }
 
-  // 1) Create the group on the platform. If this throws we don't write anything to the DB.
+  // 1) Create the group on the platform.
   let platformId: string;
   let inviteLink: string | null = null;
   try {
@@ -505,16 +530,13 @@ export async function applyCreateGroup(
     inviteLink = result.inviteLink;
   } catch (err) {
     log.error('createGroup failed at adapter', { name, err });
-    notifyAgent(
-      session,
-      `create_group failed: WhatsApp rejected the group creation (${err instanceof Error ? err.message : String(err)}). Nothing was wired. Tell the user the platform refused — usually a transient connection issue, sometimes an account restriction.`,
-    );
-    return;
+    return {
+      ok: false,
+      error: `WhatsApp rejected the group creation: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 
-  // 2) Persist the messaging_group + wiring. If THIS fails after the WA
-  //    group exists, we surface the partial state honestly so the agent
-  //    doesn't claim success or try to recreate.
+  // 2) Persist messaging_group + wiring.
   try {
     const mg = {
       id: generateId('mg'),
@@ -527,7 +549,7 @@ export async function applyCreateGroup(
       created_at: new Date().toISOString(),
     };
     createMessagingGroup(mg);
-    log.info('Messaging group created via create_group', { id: mg.id, platform_id: platformId });
+    log.info('Messaging group created via createGroupCore', { id: mg.id, platform_id: platformId });
 
     const mgaId = generateId('mga');
     createMessagingGroupAgent({
@@ -542,29 +564,93 @@ export async function applyCreateGroup(
       priority: 0,
       created_at: new Date().toISOString(),
     });
-    log.info('Channel wired via create_group', {
+    log.info('Channel wired via createGroupCore', {
       messagingGroupId: mg.id,
       agentGroupId: targetAgentGroupId,
       isolation,
       engage_mode,
     });
 
-    // 3) Pre-populate discovered_channels so list_discovered_groups sees the
-    //    new group on the very next call (without waiting for Baileys' next
-    //    metadata sync tick).
     upsertDiscoveredChannel('whatsapp', platformId, name, true);
 
-    notifyAgent(
-      session,
-      `WhatsApp group "${name}" created and wired.\nplatform_id=${platformId}\nagent_group_id=${targetAgentGroupId}\nisolation=${isolation}, engage=${engage_mode}${engage_pattern ? `:${engage_pattern}` : ''}, sender_policy=${unknown_sender_policy}\ninvite_link=${inviteLink ?? '(WhatsApp did not return an invite link this time — you can ask the user to share it manually from inside the group)'}\n\nReport to the user in Spanish:\n  • The group is created and you are listening in it.\n  • Share the invite link so they (and others) can join.\n  • Note that there can be a 1-2 second lag for WhatsApp to fully sync the group state — first message in the group might take a moment to engage.`,
-    );
+    // Resolve folder from agent group (may differ from input.folder if existing was reused).
+    const finalAg = getAgentGroup(targetAgentGroupId);
+    const finalFolder = finalAg?.folder ?? folder ?? '';
+
+    return {
+      ok: true,
+      platformId,
+      agentGroupId: targetAgentGroupId,
+      folder: finalFolder,
+      inviteLink,
+      isolation,
+      engageMode: engage_mode,
+      engagePattern: engage_pattern,
+      unknownSenderPolicy: unknown_sender_policy,
+    };
   } catch (err) {
     log.error('create_group post-create wiring failed', { platformId, err });
+    return {
+      ok: false,
+      error: `wiring to DB failed after WA group creation: ${err instanceof Error ? err.message : String(err)}`,
+      partial: { platformId, inviteLink },
+    };
+  }
+}
+
+export async function applyCreateGroup(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
+  const userId = getLastInboundUserId(inDb);
+  if (!userId) {
     notifyAgent(
       session,
-      `Partial failure on create_group: the WhatsApp group "${name}" was created on the platform (platform_id=${platformId}, invite_link=${inviteLink ?? 'unknown'}), BUT writing the wiring to the central DB failed (${err instanceof Error ? err.message : String(err)}).\n\nReport this to the user honestly: the group exists in WhatsApp (share the invite link if available), but I am NOT yet listening in it. Offer to retry registration with: register_channel platform_id="${platformId}" channel_type="whatsapp" name="${name}" isolation="${isolation}".`,
+      'create_group rejected: could not resolve the calling user from the current session.',
     );
+    return;
   }
+
+  const name = (content.name as string | undefined) ?? '';
+  const isolation = (content.isolation as Isolation | undefined) ?? 'separate-session';
+  // Default agent_group_id to caller's session.agent_group_id for non-separate-agent.
+  const explicitAgentGroupId = content.agent_group_id as string | undefined;
+  const effectiveAgentGroupId =
+    isolation === 'separate-agent'
+      ? explicitAgentGroupId ?? session.agent_group_id
+      : explicitAgentGroupId ?? session.agent_group_id;
+
+  const result = await createGroupCore(
+    {
+      name,
+      isolation,
+      folder: content.folder as string | undefined,
+      agent_group_id: effectiveAgentGroupId,
+      engage_mode: content.engage_mode as EngageMode | undefined,
+      engage_pattern: content.engage_pattern as string | null | undefined,
+      unknown_sender_policy: content.unknown_sender_policy as UnknownSenderPolicy | undefined,
+      assistant_name: content.assistant_name as string | undefined,
+    },
+    userId,
+  );
+
+  if (!result.ok) {
+    if (result.partial) {
+      notifyAgent(
+        session,
+        `Partial failure on create_group: the WhatsApp group "${name}" was created on the platform (platform_id=${result.partial.platformId}, invite_link=${result.partial.inviteLink ?? 'unknown'}), BUT ${result.error}.\n\nReport this to the user honestly: the group exists in WhatsApp (share the invite link if available), but I am NOT yet listening in it. Offer to retry registration with: register_channel platform_id="${result.partial.platformId}" channel_type="whatsapp" name="${name}" isolation="${isolation}".`,
+      );
+    } else {
+      notifyAgent(session, `create_group rejected: ${result.error}.`);
+    }
+    return;
+  }
+
+  notifyAgent(
+    session,
+    `WhatsApp group "${name}" created and wired.\nplatform_id=${result.platformId}\nagent_group_id=${result.agentGroupId}\nisolation=${result.isolation}, engage=${result.engageMode}${result.engagePattern ? `:${result.engagePattern}` : ''}, sender_policy=${result.unknownSenderPolicy}\ninvite_link=${result.inviteLink ?? '(WhatsApp did not return an invite link this time — you can ask the user to share it manually from inside the group)'}\n\nReport to the user in Spanish:\n  • The group is created and you are listening in it.\n  • Share the invite link so they (and others) can join.\n  • Note that there can be a 1-2 second lag for WhatsApp to fully sync the group state — first message in the group might take a moment to engage.`,
+  );
 }
 
 export async function applyGetInviteLink(

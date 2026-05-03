@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# extract-frames <sticker-path> [out-dir] [--max-frames N]
+# Detects format and dispatches to ffmpeg (webp) or render-lottie.mjs (Lottie).
+# Outputs frame paths to stdout, one per line.
+
+set -euo pipefail
+
+SRC=""
+OUT=""
+MAX_FRAMES="60"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --max-frames)
+      MAX_FRAMES="$2"; shift 2 ;;
+    --max-frames=*)
+      MAX_FRAMES="${1#*=}"; shift ;;
+    -*)
+      echo "extract-frames: unknown flag $1" >&2; exit 2 ;;
+    *)
+      if [[ -z "$SRC" ]]; then SRC="$1"
+      elif [[ -z "$OUT" ]]; then OUT="$1"
+      else echo "extract-frames: too many positional args" >&2; exit 2
+      fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$SRC" ]]; then
+  echo "usage: extract-frames <sticker-path> [out-dir] [--max-frames N]" >&2
+  exit 2
+fi
+
+if [[ ! -f "$SRC" ]]; then
+  echo "extract-frames: not a file: $SRC" >&2
+  exit 1
+fi
+
+if [[ -z "$OUT" ]]; then
+  OUT="/tmp/sticker-frames-$(date +%s%N)"
+fi
+mkdir -p "$OUT"
+
+HEAD_HEX=$(head -c 16 "$SRC" | od -A n -t x1 | tr -d ' \n')
+
+case "$HEAD_HEX" in
+  52494646*57454250*)
+    # RIFF....WEBP — static or animated WebP, ffmpeg handles both
+    ffmpeg -hide_banner -loglevel error -i "$SRC" -vsync 0 -frames:v "$MAX_FRAMES" "$OUT/frame_%03d.png"
+    ;;
+  1f8b*)
+    # gzip — typical Lottie .was wrapper
+    gunzip -c "$SRC" > "$OUT/lottie.json"
+    node "$(dirname "$0")/render-lottie.mjs" "$OUT/lottie.json" "$OUT" "$MAX_FRAMES"
+    ;;
+  7b*|5b*)
+    # raw JSON ({ or [) — unwrapped Lottie
+    cp "$SRC" "$OUT/lottie.json"
+    node "$(dirname "$0")/render-lottie.mjs" "$OUT/lottie.json" "$OUT" "$MAX_FRAMES"
+    ;;
+  *)
+    echo "extract-frames: unknown format (magic bytes: ${HEAD_HEX:0:16})" >&2
+    exit 1
+    ;;
+esac
+
+# Emit frame paths in order
+ls "$OUT"/frame_*.png 2>/dev/null | sort
