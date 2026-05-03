@@ -106,6 +106,9 @@ ENV U2NET_HOME=/home/node/.u2net
 # PyTorch / paddlepaddle / transformers (~2GB combined) and use ONNX-only
 # packages — adds ~200MB to the image.
 #
+#   - opencv-python-headless: image IO for rapidocr (pre-installed FIRST so
+#     pip won't pull opencv-python full ~190MB with X11/GTK/Qt bindings we
+#     don't use in a headless container).
 #   - rapidocr-onnxruntime: PaddleOCR det+rec models exported to ONNX,
 #     bundled inside the wheel (no separate download).
 #   - fastembed: minimal embeddings runtime; pre-fetch the multilingual MiniLM
@@ -113,6 +116,7 @@ ENV U2NET_HOME=/home/node/.u2net
 #     agent call doesn't block on a download. (e5-small isn't supported in
 #     fastembed 0.8 — only e5-large at 2.24GB; MiniLM is the lighter pick.)
 RUN pip3 install --break-system-packages --no-cache-dir \
+        opencv-python-headless \
         rapidocr-onnxruntime \
         fastembed \
     && mkdir -p /home/node/.fastembed \
