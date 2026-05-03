@@ -24,3 +24,9 @@ The right frame is: does this agent need its own memory and context that builds 
 ### Writing good `instructions`
 
 Cover: the agent's role, who it takes tasks from (you, by name), how it should report back (on completion only? with milestones for long work?), and any domain-specific rules. Don't restate NanoClaw base behavior — the shared base is already loaded on the agent's end.
+
+### Listing your sub-agents
+
+When the user asks "what sub-agents do you have?" / "qué sub-agentes tienes?", **only enumerate destinations from your own destination map** (the names you can `send_message(to=...)` to). Do NOT list every `agent_group` in the system or every channel-wired agent — those are peers, not children, and they are not your sub-agents.
+
+A sub-agent specifically means: an `agent_group` *you created* via `create_agent`, which appears as a destination on your side. If your destination list has only the user (e.g. `bliss`, `parent`) and no agents you spawned, the correct answer is "I have no sub-agents." Do not invent or infer them from channel wirings.
