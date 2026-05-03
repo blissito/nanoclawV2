@@ -68,6 +68,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
 
+    // Touch heartbeat every iteration — including idle ticks. Without this,
+    // `/workspace/.heartbeat` only refreshes inside the active SDK stream
+    // (line ~414), so a healthy idle container gets killed by the host's
+    // ABSOLUTE_CEILING_MS sweep (host-sweep.ts:54, currently 30 min).
+    touchHeartbeat();
+
     // Periodic heartbeat so we know the loop is alive
     if (pollCount % 30 === 0) {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
