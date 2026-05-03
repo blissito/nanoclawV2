@@ -101,6 +101,22 @@ RUN pip3 install --break-system-packages --no-cache-dir \
     && chown -R node:node /home/node/.u2net
 ENV U2NET_HOME=/home/node/.u2net
 
+# ---- ML CPU toolchain (OCR + embeddings) -------------------------------------
+# Both run on the same onnxruntime installed above. We deliberately avoid
+# PyTorch / paddlepaddle / transformers (~2GB combined) and use ONNX-only
+# packages — adds ~200MB to the image.
+#
+#   - rapidocr-onnxruntime: PaddleOCR det+rec models exported to ONNX,
+#     bundled inside the wheel (no separate download).
+#   - fastembed: minimal embeddings runtime; pre-fetch multilingual-e5-small
+#     (~120MB) at build so the first agent call doesn't block on a download.
+RUN pip3 install --break-system-packages --no-cache-dir \
+        rapidocr-onnxruntime \
+        fastembed \
+    && mkdir -p /home/node/.fastembed \
+    && python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='intfloat/multilingual-e5-small', cache_dir='/home/node/.fastembed')" \
+    && chown -R node:node /home/node/.fastembed
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.

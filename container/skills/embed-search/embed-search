@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# embed-search: semantic search over text files using local embeddings (fastembed).
+# Free, local, multilingual (es/en/+90 langs). No API.
+#
+# Usage:
+#   embed-search "qué dijo del proyecto x" /workspace/group/conversations/
+#   embed-search "factura febrero" --top 10 /workspace/group/notes/
+#   embed-search --json "rebrand" /workspace/group/
+#   embed-search --rebuild "query" /workspace/group/        # force re-index
+#
+# Behavior:
+#   - Indexes all .md / .txt files under the directory (recursive).
+#   - Index cached at /workspace/group/.embed-index.json — incremental on file mtime.
+#   - Returns top-N most relevant chunks (default 5), each with file path + preview.
+import argparse
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+INDEX_FILE_NAME = ".embed-index.json"
+MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-d, ~120MB, multilingual
+CHUNK_SIZE = 600       # chars per chunk
+CHUNK_OVERLAP = 100
+EXTS = {".md", ".txt", ".markdown"}
+
+
+def chunk_text(text: str):
+    chunks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        chunks.append(text[i:i + CHUNK_SIZE])
+        if i + CHUNK_SIZE >= n:
+            break
+        i += CHUNK_SIZE - CHUNK_OVERLAP
+    return chunks
+
+
+def file_signature(path: Path):
+    st = path.stat()
+    return f"{st.st_mtime_ns}-{st.st_size}"
+
+
+def load_index(index_path: Path):
+    if not index_path.exists():
+        return None
+    try:
+        with open(index_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_index(index_path: Path, index: dict):
+    with open(index_path, "w") as f:
+        json.dump(index, f)
+
+
+def gather_files(root: Path):
+    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTS and INDEX_FILE_NAME not in p.name)
+
+
+def build_or_update_index(root: Path, model, rebuild: bool):
+    import numpy as np
+    index_path = root / INDEX_FILE_NAME
+    existing = None if rebuild else load_index(index_path)
+    if existing and existing.get("model") != MODEL_NAME:
+        existing = None  # model changed → invalidate
+
+    files = gather_files(root)
+    new_index = {"model": MODEL_NAME, "files": {}, "chunks": []}
+
+    files_to_embed = []
+    for f in files:
+        sig = file_signature(f)
+        rel = str(f.relative_to(root))
+        if existing and rel in existing["files"] and existing["files"][rel]["sig"] == sig:
+            new_index["files"][rel] = existing["files"][rel]
+            for ci in existing["files"][rel]["chunk_idxs"]:
+                new_index["chunks"].append(existing["chunks"][ci])
+            continue
+        files_to_embed.append((f, rel, sig))
+
+    if files_to_embed:
+        print(f"# embedding {len(files_to_embed)} file(s)...", file=sys.stderr)
+        for f, rel, sig in files_to_embed:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                print(f"# skip {rel}: {e}", file=sys.stderr)
+                continue
+            chunks = chunk_text(text)
+            if not chunks:
+                continue
+            # e5 expects "passage: " prefix for documents
+            embs = list(model.embed([f"passage: {c}" for c in chunks]))
+            chunk_idxs = []
+            for chunk, emb in zip(chunks, embs):
+                idx = len(new_index["chunks"])
+                new_index["chunks"].append({
+                    "file": rel,
+                    "text": chunk,
+                    "vec": [round(float(v), 5) for v in emb],
+                })
+                chunk_idxs.append(idx)
+            new_index["files"][rel] = {"sig": sig, "chunk_idxs": chunk_idxs}
+
+    save_index(index_path, new_index)
+    return new_index
+
+
+def cosine_search(query_vec, chunks, top_k):
+    import numpy as np
+    if not chunks:
+        return []
+    matrix = np.array([c["vec"] for c in chunks], dtype=np.float32)
+    q = np.array(query_vec, dtype=np.float32)
+    matrix_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9)
+    q_norm = q / (np.linalg.norm(q) + 1e-9)
+    sims = matrix_norm @ q_norm
+    top = sims.argsort()[::-1][:top_k]
+    return [(int(i), float(sims[i])) for i in top]
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Semantic search over text files using local multilingual embeddings.",
+    )
+    ap.add_argument("query", help="What to search for")
+    ap.add_argument("root", help="Directory to search (recurses .md/.txt files)")
+    ap.add_argument("--top", type=int, default=5, help="Top N chunks. Default 5")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--rebuild", action="store_true", help="Discard existing index and re-embed")
+    ap.add_argument("--preview-len", type=int, default=300, help="Chars of chunk to show. Default 300")
+    args = ap.parse_args()
+
+    root = Path(args.root)
+    if not root.is_dir():
+        sys.exit(f"ERROR: not a directory: {root}")
+
+    try:
+        from fastembed import TextEmbedding
+    except ImportError:
+        sys.exit("ERROR: fastembed not installed. Rebuild the container image.")
+
+    model = TextEmbedding(model_name=MODEL_NAME, cache_dir="/home/node/.fastembed")
+    index = build_or_update_index(root, model, args.rebuild)
+    if not index["chunks"]:
+        sys.exit(f"ERROR: no .md/.txt files indexed under {root}")
+
+    query_emb = list(model.embed([f"query: {args.query}"]))[0]
+    hits = cosine_search(query_emb, index["chunks"], args.top)
+
+    results = []
+    for idx, score in hits:
+        ch = index["chunks"][idx]
+        preview = ch["text"][:args.preview_len].strip()
+        results.append({
+            "file": ch["file"],
+            "score": round(score, 4),
+            "preview": preview,
+        })
+
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+
+    for r in results:
+        print(f"[{r['score']:.3f}] {r['file']}")
+        print(f"    {r['preview']}")
+        print()
+
+
+if __name__ == "__main__":
+    main()

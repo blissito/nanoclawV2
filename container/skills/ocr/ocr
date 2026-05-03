@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+# ocr: extract text from images with PaddleOCR weights via onnxruntime.
+# Free, local, no API. Multi-language (es/en/zh/ja/ko etc). Models bake into image.
+#
+# Usage:
+#   ocr image.png                       # plain text, one line per detected box
+#   ocr --json image.png                # full output: text, box coords, confidence
+#   ocr --min-confidence 0.6 image.png  # filter low-confidence detections
+#   ocr --batch dir-or-glob             # process many files
+import argparse
+import glob
+import json
+import sys
+from pathlib import Path
+
+
+def expand_batch(spec: str):
+    p = Path(spec)
+    if p.is_dir():
+        exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".pdf"}
+        return sorted(f for f in p.iterdir() if f.suffix.lower() in exts)
+    matches = [Path(m) for m in glob.glob(spec)]
+    if not matches:
+        sys.exit(f"ERROR: --batch matched no files: {spec}")
+    return sorted(matches)
+
+
+def run_ocr(engine, path: Path, min_conf: float):
+    result, _ = engine(str(path))
+    if not result:
+        return []
+    out = []
+    for box, text, conf in result:
+        if conf < min_conf:
+            continue
+        out.append({
+            "text": text,
+            "confidence": round(float(conf), 3),
+            "box": [[round(float(x), 1), round(float(y), 1)] for x, y in box],
+        })
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="OCR via PaddleOCR weights on onnxruntime (free, local, multi-lang).",
+    )
+    ap.add_argument("input", nargs="?", help="Image path (omit if using --batch)")
+    ap.add_argument("--json", action="store_true",
+                    help="Output JSON with text + box + confidence per detection")
+    ap.add_argument("--min-confidence", type=float, default=0.5,
+                    help="Drop detections below this score (0-1). Default 0.5")
+    ap.add_argument("--batch", help="Process a directory or glob pattern")
+    args = ap.parse_args()
+
+    if not args.batch and not args.input:
+        ap.print_usage(sys.stderr)
+        sys.exit("ERROR: provide an input image or --batch")
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        sys.exit("ERROR: rapidocr-onnxruntime not installed. Rebuild the container image.")
+
+    engine = RapidOCR()
+    inputs = expand_batch(args.batch) if args.batch else [Path(args.input)]
+
+    if args.json:
+        all_results = {}
+        for path in inputs:
+            if not path.exists():
+                sys.exit(f"ERROR: File not found: {path}")
+            all_results[str(path)] = run_ocr(engine, path, args.min_confidence)
+        print(json.dumps(all_results, ensure_ascii=False, indent=2))
+        return
+
+    for path in inputs:
+        if not path.exists():
+            sys.exit(f"ERROR: File not found: {path}")
+        if len(inputs) > 1:
+            print(f"=== {path} ===")
+        for det in run_ocr(engine, path, args.min_confidence):
+            print(det["text"])
+
+
+if __name__ == "__main__":
+    main()
