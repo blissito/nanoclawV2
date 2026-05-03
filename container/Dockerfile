@@ -88,6 +88,19 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 # yt-dlp is already installed via apt above.
 RUN pip3 install --break-system-packages --no-cache-dir openpyxl pandas
 
+# ---- Background removal (rembg + u2net family) -------------------------------
+# CPU-only onnxruntime. Pre-download the default `u2net` model to ~/.u2net so
+# the first call inside an agent container doesn't block on a 170MB download.
+# Other models (u2net_human_seg, u2net_cloth_seg, isnet-*, etc.) lazy-download
+# on first use and cache to the same dir — that dir is baked into the image.
+RUN pip3 install --break-system-packages --no-cache-dir \
+        rembg \
+        onnxruntime \
+    && mkdir -p /home/node/.u2net \
+    && U2NET_HOME=/home/node/.u2net python3 -c "from rembg import new_session; new_session('u2net')" \
+    && chown -R node:node /home/node/.u2net
+ENV U2NET_HOME=/home/node/.u2net
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.

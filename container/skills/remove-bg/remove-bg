@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+# remove-bg: background removal & segmentation via u2net family (rembg).
+# Free, local, no API keys. Models cached in ~/.u2net/.
+#
+# Usage:
+#   remove-bg image.png                                    # default u2net, transparent bg
+#   remove-bg --model u2net_human_seg portrait.jpg         # human-tuned
+#   remove-bg --model u2net_cloth_seg outfit.jpg           # 3-class cloth segmentation
+#   remove-bg --model isnet-general-use product.png        # alt general
+#   remove-bg --model isnet-anime char.png                 # anime / illustration
+#   remove-bg --alpha-matting hair-pic.jpg                 # soft edges (hair, fur)
+#   remove-bg --bg-color 255,255,255 product.png           # composite onto white
+#   remove-bg --bg-image scene.jpg subject.png             # composite onto image
+#   remove-bg --mask-only image.png                        # just the alpha mask
+#   remove-bg --post-process image.png                     # cleaner mask edges
+#   remove-bg --batch /path/to/dir                         # all images in dir
+#   remove-bg --batch '*.jpg'                              # glob pattern
+import argparse
+import glob
+import os
+import sys
+import time
+from pathlib import Path
+
+OUTPUT_DIR = Path("/workspace/agent")
+
+MODELS = {
+    "u2net":              "general — default, balanced quality (170MB)",
+    "u2netp":             "lightweight u2net (4MB), faster but rougher",
+    "u2net_human_seg":    "humans / portraits",
+    "u2net_cloth_seg":    "clothing — outputs 3-class mask (upper / lower / full)",
+    "silueta":            "u2net alternative, slightly different bias",
+    "isnet-general-use":  "ISNet — sharper general-purpose alternative",
+    "isnet-anime":        "anime / illustrated characters",
+}
+
+
+def parse_color(spec: str):
+    parts = [p.strip() for p in spec.split(",")]
+    if len(parts) not in (3, 4):
+        sys.exit(f"ERROR: --bg-color must be 'r,g,b' or 'r,g,b,a'. Got: {spec}")
+    try:
+        vals = [int(p) for p in parts]
+    except ValueError:
+        sys.exit(f"ERROR: --bg-color values must be integers 0-255. Got: {spec}")
+    if any(v < 0 or v > 255 for v in vals):
+        sys.exit(f"ERROR: --bg-color values must be 0-255. Got: {spec}")
+    if len(vals) == 3:
+        vals.append(255)
+    return tuple(vals)
+
+
+def output_path(input_path: Path, suffix: str = "") -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = input_path.stem
+    ts = int(time.time() * 1000)
+    tag = f"-{suffix}" if suffix else ""
+    return OUTPUT_DIR / f"nobg-{stem}{tag}-{ts}.png"
+
+
+def composite_on_color(cutout_img, color):
+    from PIL import Image
+    bg = Image.new("RGBA", cutout_img.size, color)
+    bg.paste(cutout_img, mask=cutout_img.split()[3])
+    return bg.convert("RGB")
+
+
+def composite_on_image(cutout_img, bg_path: Path):
+    from PIL import Image
+    bg = Image.open(bg_path).convert("RGBA").resize(cutout_img.size)
+    bg.paste(cutout_img, mask=cutout_img.split()[3])
+    return bg.convert("RGB")
+
+
+def process_one(session, input_path: Path, args) -> Path:
+    from PIL import Image
+    from rembg import remove
+
+    if not input_path.exists():
+        sys.exit(f"ERROR: File not found: {input_path}")
+
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    result = remove(
+        data,
+        session=session,
+        alpha_matting=args.alpha_matting,
+        alpha_matting_foreground_threshold=args.fg_threshold,
+        alpha_matting_background_threshold=args.bg_threshold,
+        alpha_matting_erode_size=args.erode_size,
+        only_mask=args.mask_only,
+        post_process_mask=args.post_process,
+    )
+
+    suffix = ""
+    if args.mask_only:
+        suffix = "mask"
+    elif args.model != "u2net":
+        suffix = args.model.replace("_", "-")
+
+    out = output_path(input_path, suffix)
+
+    if args.bg_color or args.bg_image:
+        from io import BytesIO
+        cutout = Image.open(BytesIO(result)).convert("RGBA")
+        if args.bg_image:
+            final = composite_on_image(cutout, Path(args.bg_image))
+        else:
+            final = composite_on_color(cutout, parse_color(args.bg_color))
+        out = out.with_suffix(".jpg")
+        final.save(out, "JPEG", quality=92)
+    else:
+        with open(out, "wb") as f:
+            f.write(result)
+
+    return out
+
+
+def expand_batch(spec: str):
+    p = Path(spec)
+    if p.is_dir():
+        exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        return sorted(f for f in p.iterdir() if f.suffix.lower() in exts)
+    matches = [Path(m) for m in glob.glob(spec)]
+    if not matches:
+        sys.exit(f"ERROR: --batch matched no files: {spec}")
+    return sorted(matches)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Background removal & segmentation via u2net family (free, local).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Models:\n  " + "\n  ".join(f"{k:22s} {v}" for k, v in MODELS.items()),
+    )
+    ap.add_argument("input", nargs="?", help="Image path (omit if using --batch)")
+    ap.add_argument("--model", default="u2net", choices=list(MODELS),
+                    help="Segmentation model. Default: u2net")
+    ap.add_argument("--alpha-matting", action="store_true",
+                    help="Refine edges (better for hair, fur, soft edges). Slower.")
+    ap.add_argument("--fg-threshold", type=int, default=240,
+                    help="Alpha matting foreground threshold (0-255). Default 240.")
+    ap.add_argument("--bg-threshold", type=int, default=10,
+                    help="Alpha matting background threshold (0-255). Default 10.")
+    ap.add_argument("--erode-size", type=int, default=10,
+                    help="Alpha matting erode size in pixels. Default 10.")
+    ap.add_argument("--post-process", action="store_true",
+                    help="Morphological cleanup of the mask. Removes specks.")
+    ap.add_argument("--mask-only", action="store_true",
+                    help="Output the alpha mask (grayscale) instead of the cutout.")
+    ap.add_argument("--bg-color", help="Composite onto solid color 'r,g,b' or 'r,g,b,a'.")
+    ap.add_argument("--bg-image", help="Composite onto image at this path.")
+    ap.add_argument("--batch", help="Process a directory or glob pattern.")
+    ap.add_argument("--list-models", action="store_true",
+                    help="Print available models and exit.")
+    args = ap.parse_args()
+
+    if args.list_models:
+        for k, v in MODELS.items():
+            print(f"{k:22s} {v}")
+        return
+
+    if args.bg_color and args.bg_image:
+        sys.exit("ERROR: --bg-color and --bg-image are mutually exclusive.")
+    if args.mask_only and (args.bg_color or args.bg_image):
+        sys.exit("ERROR: --mask-only cannot be combined with --bg-color or --bg-image.")
+
+    if not args.batch and not args.input:
+        ap.print_usage(sys.stderr)
+        sys.exit("ERROR: provide an input image or --batch.")
+
+    try:
+        from rembg import new_session
+    except ImportError:
+        sys.exit("ERROR: rembg not installed. Rebuild the container image (./container/build.sh).")
+
+    session = new_session(args.model)
+
+    inputs = expand_batch(args.batch) if args.batch else [Path(args.input)]
+    for path in inputs:
+        out = process_one(session, path, args)
+        print(out)
+
+
+if __name__ == "__main__":
+    main()
