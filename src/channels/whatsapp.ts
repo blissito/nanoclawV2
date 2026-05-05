@@ -356,6 +356,35 @@ registerChannelAdapter('whatsapp', {
       }
     }
 
+    // Recovery for `item-not-found` on group sends. WhatsApp returns this
+    // when our cached Signal sessions for some group participants are stale
+    // — typical after a participant changed device, rotated keys, or after
+    // the piggyback host (the user's own WA) re-paired. Forcing a fresh
+    // groupMetadata + assertSessions(force=true) makes Baileys refetch
+    // prekey bundles for every participant, which clears the bad state.
+    async function recoverGroupSenderKeys(jid: string): Promise<boolean> {
+      if (!jid.endsWith('@g.us')) return false;
+      try {
+        groupMetadataCache.delete(jid);
+        const metadata = await sock.groupMetadata(jid);
+        groupMetadataCache.set(jid, {
+          metadata,
+          expiresAt: Date.now() + GROUP_METADATA_CACHE_TTL_MS,
+        });
+        const participantIds = metadata.participants.map((p) => p.id);
+        const sockUnknown = sock as unknown as {
+          assertSessions?: (jids: string[], force: boolean) => Promise<unknown>;
+        };
+        if (typeof sockUnknown.assertSessions === 'function') {
+          await sockUnknown.assertSessions(participantIds, true);
+        }
+        return true;
+      } catch (err) {
+        log.warn('Failed to recover group sender keys', { jid, err });
+        return false;
+      }
+    }
+
     async function syncGroupMetadata(force = false): Promise<void> {
       if (!force && lastGroupSync && Date.now() - lastGroupSync < GROUP_SYNC_INTERVAL_MS) {
         return;
@@ -575,10 +604,10 @@ registerChannelAdapter('whatsapp', {
         log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
         return;
       }
+      const payload = mentions && mentions.length > 0
+        ? { text, mentions }
+        : { text };
       try {
-        const payload = mentions && mentions.length > 0
-          ? { text, mentions }
-          : { text };
         const sent = await sock.sendMessage(jid, payload);
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
@@ -589,6 +618,34 @@ registerChannelAdapter('whatsapp', {
         }
         return sent?.key?.id ?? undefined;
       } catch (err) {
+        const errMsg = String((err as { message?: unknown })?.message ?? err ?? '');
+        // `item-not-found` on a group send means our cached Signal sessions
+        // for some participants are stale. Re-queueing retries with the same
+        // broken state and loops forever — instead, recover sender keys and
+        // retry once. Drop on second failure to avoid pathological queues.
+        if (errMsg.includes('item-not-found') && jid.endsWith('@g.us')) {
+          log.warn('item-not-found on group send; attempting Signal session recovery', { jid });
+          const recovered = await recoverGroupSenderKeys(jid);
+          if (recovered) {
+            try {
+              const sent = await sock.sendMessage(jid, payload);
+              if (sent?.key?.id && sent.message) {
+                sentMessageCache.set(sent.key.id, sent.message);
+                if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
+                  const oldest = sentMessageCache.keys().next().value!;
+                  sentMessageCache.delete(oldest);
+                }
+              }
+              log.info('Recovered from item-not-found and resent', { jid, msgId: sent?.key?.id });
+              return sent?.key?.id ?? undefined;
+            } catch (retryErr) {
+              log.error('Recovery retry still failed; dropping message', { jid, retryErr });
+              return undefined;
+            }
+          }
+          log.error('Recovery failed; dropping message', { jid });
+          return undefined;
+        }
         outgoingQueue.push({ jid, text });
         log.warn('Failed to send, message queued', { jid, err, queueSize: outgoingQueue.length });
         return undefined;
